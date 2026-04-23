@@ -1,0 +1,53 @@
+app:
+  name: pulse-service
+  version: dev
+  environment: development
+
+logging:
+  level: info
+  format: json
+  output: stdout
+
+server:
+  http:
+    enabled: true
+    host: 0.0.0.0
+    port: "8086"
+    base_path: /api/v1
+    timeouts:
+      read: 15s
+      write: 15s
+      idle: 60s
+      shutdown: 30s
+  grpc:
+    enabled: true
+    host: 0.0.0.0
+    port: "50086"
+
+database:
+  postgres:
+    host: localhost
+    port: "5432"
+    user: postgres
+    password: postgres
+    database: pulse_service
+    ssl_mode: disable
+    pool:
+      max_open_conns: 25
+      max_idle_conns: 10
+      max_lifetime: 5m
+      max_idle_time: 10m
+    log_level: warn
+
+messaging:
+  kafka:
+    enabled: true
+    brokers: localhost:9092
+    client_id: pulse-service-1
+    group_id: pulse-service
+    topics:
+      prefix: sentiae
+      pulse_events: sentiae.pulse.events
+
+features:
+  event_publishing: true
