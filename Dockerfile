@@ -15,7 +15,7 @@ RUN go mod download
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /server ./cmd/server
 
 # Runtime stage
-FROM gcr.io/distroless/static-debian12
+FROM alpine:3.19
 
 WORKDIR /app
 
@@ -26,6 +26,5 @@ EXPOSE 8086 50086
 
 LABEL org.opencontainers.image.source="https://github.com/sentiae/pulse-service"
 
-USER nonroot:nonroot
 
 ENTRYPOINT ["/app/server"]

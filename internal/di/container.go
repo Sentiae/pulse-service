@@ -3,8 +3,10 @@ package di
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"strconv"
+	"time"
 
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
@@ -101,6 +103,13 @@ func (c *Container) initDatabase() error {
 func (c *Container) initInfrastructure() {
 	publish := c.Config.Messaging.Kafka.Enabled && c.Config.Features.EventPublishing
 	c.Publisher = events.NewKafkaPublisher(c.Config.GetKafkaBrokers(), publish)
+	if publish {
+		ensureCtx, ensureCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		if err := c.Publisher.EnsureTopics(ensureCtx); err != nil {
+			log.Printf("Warning: pulse-service Kafka EnsureTopics failed: %v (continuing)", err)
+		}
+		ensureCancel()
+	}
 }
 
 func (c *Container) initRepositories() {
