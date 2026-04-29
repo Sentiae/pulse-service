@@ -2,11 +2,13 @@ package usecase
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"net/http"
 	"sync"
 	"time"
+
+	opsv1 "github.com/sentiae/ops-service/gen/ops/v1"
+	workv1 "github.com/sentiae/work-service/gen/proto/work/v1"
+	"google.golang.org/grpc"
 )
 
 // Aggregator is the §3 (Phase 4) server-side Pulse aggregator. Before
@@ -16,35 +18,29 @@ import (
 // different snapshot depending on their network timing and
 // (2) duplicated the federation logic in portal/BFF/mobile.
 //
-// Aggregator centralizes that fan-out. A single `GET
-// /api/v1/pulse/summary` call returns a consistent snapshot the
-// portal can render directly. Individual signals that fail to fetch
-// surface as nil fields (not hard errors) so partial outages don't
-// black out the landing page.
+// Aggregator centralizes that fan-out via gRPC (CLAUDE.md §13). A
+// single `GET /api/v1/pulse/summary` call returns a consistent
+// snapshot the portal can render directly. Individual signals that
+// fail to fetch surface as nil fields (not hard errors) so partial
+// outages don't black out the landing page.
 type Aggregator struct {
-	http     *http.Client
-	opsURL   string
-	workURL  string
-	dataURL  string
-	token    string
-	cacheTTL time.Duration
+	opsArch     opsv1.OpsArchitectureServiceClient
+	opsDeploy   opsv1.OpsDeploymentServiceClient
+	opsIncident opsv1.OpsIncidentServiceClient
+	workSpec    workv1.WorkSpecServiceClient
+	cacheTTL    time.Duration
 
 	mu          sync.RWMutex
 	lastSnap    *Snapshot
 	lastFetched time.Time
 }
 
-// AggregatorConfig captures the cross-service base URLs. Each is
-// optional — a missing URL just means that signal gets skipped.
+// AggregatorConfig captures cross-service gRPC connections. Each
+// connection is optional — a nil one just means that signal gets
+// skipped.
 type AggregatorConfig struct {
-	OpsServiceURL  string
-	WorkServiceURL string
-	DataServiceURL string
-	// ServiceToken is forwarded as `Authorization: Bearer` so the
-	// downstream services' service-to-service auth recognises pulse.
-	ServiceToken string
-	// HTTPTimeout caps each downstream call. Defaults to 3s.
-	HTTPTimeout time.Duration
+	OpsConn  *grpc.ClientConn
+	WorkConn *grpc.ClientConn
 	// CacheTTL is how long a Snapshot is served from memory before a
 	// fresh fan-out. Defaults to 30s — the Pulse landing refetches at
 	// the same cadence so caching dampens the fan-out without making
@@ -52,41 +48,38 @@ type AggregatorConfig struct {
 	CacheTTL time.Duration
 }
 
-// NewAggregator wires the aggregator.
+// NewAggregator wires the aggregator. Nil ClientConns are fine — the
+// corresponding clients stay nil and their fan-out branch is skipped.
 func NewAggregator(cfg AggregatorConfig) *Aggregator {
-	timeout := cfg.HTTPTimeout
-	if timeout <= 0 {
-		timeout = 3 * time.Second
-	}
 	ttl := cfg.CacheTTL
 	if ttl <= 0 {
 		ttl = 30 * time.Second
 	}
-	return &Aggregator{
-		http:     &http.Client{Timeout: timeout},
-		opsURL:   cfg.OpsServiceURL,
-		workURL:  cfg.WorkServiceURL,
-		dataURL:  cfg.DataServiceURL,
-		token:    cfg.ServiceToken,
-		cacheTTL: ttl,
+	a := &Aggregator{cacheTTL: ttl}
+	if cfg.OpsConn != nil {
+		a.opsArch = opsv1.NewOpsArchitectureServiceClient(cfg.OpsConn)
+		a.opsDeploy = opsv1.NewOpsDeploymentServiceClient(cfg.OpsConn)
+		a.opsIncident = opsv1.NewOpsIncidentServiceClient(cfg.OpsConn)
 	}
+	if cfg.WorkConn != nil {
+		a.workSpec = workv1.NewWorkSpecServiceClient(cfg.WorkConn)
+	}
+	return a
 }
 
 // Snapshot is the aggregated Pulse view. Every field is a pointer so
 // missing signals are distinguishable from zero values ("no incidents"
 // vs "couldn't reach ops-service").
 type Snapshot struct {
-	GeneratedAt    time.Time        `json:"generated_at"`
-	Health         *HealthSummary   `json:"health,omitempty"`
-	DeployCadence  *DeployCadence   `json:"deploy_cadence,omitempty"`
-	ActiveIncidents *int            `json:"active_incidents,omitempty"`
-	OpenSpecs      *int             `json:"open_specs,omitempty"`
-	SignalSources  []SignalSource   `json:"signal_sources"`
+	GeneratedAt     time.Time      `json:"generated_at"`
+	Health          *HealthSummary `json:"health,omitempty"`
+	DeployCadence   *DeployCadence `json:"deploy_cadence,omitempty"`
+	ActiveIncidents *int           `json:"active_incidents,omitempty"`
+	OpenSpecs       *int           `json:"open_specs,omitempty"`
+	SignalSources   []SignalSource `json:"signal_sources"`
 }
 
-// HealthSummary is the org-wide rollup of service health. Counts sum
-// across the service catalog; `score_pct` is the healthy-proportion
-// quick-read the Pulse landing uses for its ring gauge.
+// HealthSummary is the org-wide rollup of service health.
 type HealthSummary struct {
 	Healthy   int     `json:"healthy"`
 	Degraded  int     `json:"degraded"`
@@ -100,10 +93,8 @@ type DeployCadence struct {
 	SuccessRate float64 `json:"success_rate"`
 }
 
-// SignalSource is an accounting entry: which downstream service
-// contributed which signal, and whether the fetch succeeded. The
-// portal can surface a "degraded signals" banner without the
-// aggregator having to synthesize a boolean healthy state.
+// SignalSource records which downstream contributed which signal +
+// whether the fetch succeeded. Surfaces "degraded signals" banner.
 type SignalSource struct {
 	Service string `json:"service"`
 	Signal  string `json:"signal"`
@@ -111,10 +102,7 @@ type SignalSource struct {
 	Error   string `json:"error,omitempty"`
 }
 
-// GetSnapshot returns the cached snapshot if it's fresh, otherwise
-// fans out to every configured source and rebuilds. Concurrent callers
-// during a refresh see the previous snapshot until the new one lands
-// — the aggregator never blocks a request on the fan-out path.
+// GetSnapshot returns the cached snapshot if fresh, otherwise fans out.
 func (a *Aggregator) GetSnapshot(ctx context.Context, orgID string) (*Snapshot, error) {
 	if orgID == "" {
 		return nil, fmt.Errorf("aggregator: org_id is required")
@@ -138,9 +126,7 @@ func (a *Aggregator) GetSnapshot(ctx context.Context, orgID string) (*Snapshot, 
 	return snap, nil
 }
 
-// fanOut contacts every configured downstream service in parallel and
-// assembles the Snapshot. Per-source failures record into SignalSources
-// and leave the corresponding field nil.
+// fanOut hits every configured gRPC client in parallel.
 func (a *Aggregator) fanOut(ctx context.Context, orgID string) *Snapshot {
 	snap := &Snapshot{
 		GeneratedAt:   time.Now().UTC(),
@@ -149,13 +135,19 @@ func (a *Aggregator) fanOut(ctx context.Context, orgID string) *Snapshot {
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
-	if a.opsURL != "" {
-		wg.Add(3)
+	if a.opsArch != nil {
+		wg.Add(1)
 		go a.fetchHealth(ctx, orgID, snap, &mu, &wg)
+	}
+	if a.opsDeploy != nil {
+		wg.Add(1)
 		go a.fetchDeployCadence(ctx, orgID, snap, &mu, &wg)
+	}
+	if a.opsIncident != nil {
+		wg.Add(1)
 		go a.fetchIncidents(ctx, orgID, snap, &mu, &wg)
 	}
-	if a.workURL != "" {
+	if a.workSpec != nil {
 		wg.Add(1)
 		go a.fetchOpenSpecs(ctx, orgID, snap, &mu, &wg)
 	}
@@ -166,14 +158,7 @@ func (a *Aggregator) fanOut(ctx context.Context, orgID string) *Snapshot {
 
 func (a *Aggregator) fetchHealth(ctx context.Context, orgID string, out *Snapshot, mu *sync.Mutex, wg *sync.WaitGroup) {
 	defer wg.Done()
-	var live struct {
-		Data struct {
-			Services []struct {
-				Status string `json:"status"`
-			} `json:"services"`
-		} `json:"data"`
-	}
-	err := a.getJSON(ctx, fmt.Sprintf("%s/ops/architecture/live?org_id=%s", a.opsURL, orgID), &live)
+	resp, err := a.opsArch.GetLiveArchitectureMap(ctx, &opsv1.GetLiveArchitectureMapRequest{OrganizationId: orgID})
 	mu.Lock()
 	defer mu.Unlock()
 	if err != nil {
@@ -181,13 +166,14 @@ func (a *Aggregator) fetchHealth(ctx context.Context, orgID string, out *Snapsho
 		return
 	}
 	sum := &HealthSummary{}
-	for _, s := range live.Data.Services {
-		switch s.Status {
-		case "healthy":
+	for _, n := range resp.GetNodes() {
+		// LiveArchNode.Severity is ok|warn|critical (per ops proto).
+		switch n.GetSeverity() {
+		case "ok", "":
 			sum.Healthy++
-		case "degraded":
+		case "warn":
 			sum.Degraded++
-		case "unhealthy":
+		case "critical":
 			sum.Unhealthy++
 		}
 	}
@@ -201,80 +187,49 @@ func (a *Aggregator) fetchHealth(ctx context.Context, orgID string, out *Snapsho
 
 func (a *Aggregator) fetchDeployCadence(ctx context.Context, orgID string, out *Snapshot, mu *sync.Mutex, wg *sync.WaitGroup) {
 	defer wg.Done()
-	// ops-service exposes deployment stats via /ops/deployments/stats
-	// — we read it as a best-effort signal; shape differences are
-	// surfaced as errors so downstream ships stay observable.
-	var body struct {
-		Data struct {
-			Last24h     int     `json:"last_24h"`
-			SuccessRate float64 `json:"success_rate"`
-		} `json:"data"`
-	}
-	err := a.getJSON(ctx, fmt.Sprintf("%s/ops/deployments/stats?org_id=%s", a.opsURL, orgID), &body)
+	resp, err := a.opsDeploy.GetDeploymentStats(ctx, &opsv1.GetDeploymentStatsRequest{OrganizationId: orgID})
 	mu.Lock()
 	defer mu.Unlock()
 	if err != nil {
 		out.SignalSources = append(out.SignalSources, SignalSource{Service: "ops-service", Signal: "deploy_cadence", OK: false, Error: err.Error()})
 		return
 	}
-	out.DeployCadence = &DeployCadence{Last24h: body.Data.Last24h, SuccessRate: body.Data.SuccessRate}
+	out.DeployCadence = &DeployCadence{Last24h: int(resp.GetLast_24H()), SuccessRate: resp.GetSuccessRate()}
 	out.SignalSources = append(out.SignalSources, SignalSource{Service: "ops-service", Signal: "deploy_cadence", OK: true})
 }
 
 func (a *Aggregator) fetchIncidents(ctx context.Context, orgID string, out *Snapshot, mu *sync.Mutex, wg *sync.WaitGroup) {
 	defer wg.Done()
-	var body struct {
-		Data struct {
-			Open int `json:"open"`
-		} `json:"data"`
-	}
-	err := a.getJSON(ctx, fmt.Sprintf("%s/ops/incidents/stats?org_id=%s", a.opsURL, orgID), &body)
+	resp, err := a.opsIncident.GetIncidentStats(ctx, &opsv1.GetIncidentStatsRequest{OrganizationId: orgID})
 	mu.Lock()
 	defer mu.Unlock()
 	if err != nil {
 		out.SignalSources = append(out.SignalSources, SignalSource{Service: "ops-service", Signal: "incidents", OK: false, Error: err.Error()})
 		return
 	}
-	n := body.Data.Open
+	n := int(resp.GetOpen())
 	out.ActiveIncidents = &n
 	out.SignalSources = append(out.SignalSources, SignalSource{Service: "ops-service", Signal: "incidents", OK: true})
 }
 
 func (a *Aggregator) fetchOpenSpecs(ctx context.Context, orgID string, out *Snapshot, mu *sync.Mutex, wg *sync.WaitGroup) {
 	defer wg.Done()
-	var body struct {
-		Data struct {
-			Open int `json:"open"`
-		} `json:"data"`
-	}
-	err := a.getJSON(ctx, fmt.Sprintf("%s/api/v1/work/specs/stats?org_id=%s", a.workURL, orgID), &body)
+	resp, err := a.workSpec.GetOrgSpecStats(ctx, &workv1.GetOrgSpecStatsRequest{OrganizationId: orgID})
 	mu.Lock()
 	defer mu.Unlock()
 	if err != nil {
 		out.SignalSources = append(out.SignalSources, SignalSource{Service: "work-service", Signal: "open_specs", OK: false, Error: err.Error()})
 		return
 	}
-	n := body.Data.Open
-	out.OpenSpecs = &n
+	// Open = anything not shipped/living. Sum all non-terminal status counts.
+	open := 0
+	for _, c := range resp.GetCounts() {
+		st := c.GetStatus()
+		if st == "shipped" || st == "living" {
+			continue
+		}
+		open += int(c.GetCount())
+	}
+	out.OpenSpecs = &open
 	out.SignalSources = append(out.SignalSources, SignalSource{Service: "work-service", Signal: "open_specs", OK: true})
-}
-
-// getJSON is a small helper wrapping the auth header + decode.
-func (a *Aggregator) getJSON(ctx context.Context, url string, out any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return err
-	}
-	if a.token != "" {
-		req.Header.Set("Authorization", "Bearer "+a.token)
-	}
-	resp, err := a.http.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("status %d", resp.StatusCode)
-	}
-	return json.NewDecoder(resp.Body).Decode(out)
 }

@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"time"
 
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
 
@@ -186,27 +188,40 @@ func (c *Container) initConsumers() error {
 func (c *Container) initHandlers() {
 	c.HTTPServer = httphandler.NewServer(c.FlowTracker, c.AuditRecorder)
 	c.HTTPServer.SetActivityTrackers(c.AlertTracker, c.DeployTracker)
-	// §3 Pulse aggregator — enabled when at least one downstream URL
-	// is configured via env (OPS_SERVICE_URL / WORK_SERVICE_URL /
-	// DATA_SERVICE_URL). Fail-open: aggregator-less pulse still serves
+	// §3 Pulse aggregator — gRPC fan-out to ops + work services.
+	// Enabled when at least one OPS_SERVICE_GRPC / WORK_SERVICE_GRPC
+	// address is set. Fail-open: aggregator-less pulse still serves
 	// flow endpoints.
-	if cfg := loadAggregatorConfig(); cfg.OpsServiceURL != "" || cfg.WorkServiceURL != "" || cfg.DataServiceURL != "" {
+	cfg := loadAggregatorConfig()
+	if cfg.OpsConn != nil || cfg.WorkConn != nil {
 		c.Aggregator = usecase.NewAggregator(cfg)
 		c.HTTPServer.SetAggregator(c.Aggregator)
-		logger.Info("pulse aggregator enabled (ops=%q work=%q data=%q)", cfg.OpsServiceURL, cfg.WorkServiceURL, cfg.DataServiceURL)
+		logger.Info("pulse aggregator enabled (ops=%v work=%v)", cfg.OpsConn != nil, cfg.WorkConn != nil)
 	}
 }
 
-// loadAggregatorConfig reads the cross-service URLs from the
-// environment. Kept as a helper so future config-file plumbing can
-// replace the env reads without touching initHandlers.
+// loadAggregatorConfig dials gRPC connections to ops + work services
+// from env-configured addresses (OPS_SERVICE_GRPC / WORK_SERVICE_GRPC,
+// e.g. "ops-service:50051"). Missing env = nil conn = signal skipped.
 func loadAggregatorConfig() usecase.AggregatorConfig {
-	return usecase.AggregatorConfig{
-		OpsServiceURL:  os.Getenv("OPS_SERVICE_URL"),
-		WorkServiceURL: os.Getenv("WORK_SERVICE_URL"),
-		DataServiceURL: os.Getenv("DATA_SERVICE_URL"),
-		ServiceToken:   os.Getenv("PULSE_SERVICE_TOKEN"),
+	cfg := usecase.AggregatorConfig{}
+	if addr := os.Getenv("OPS_SERVICE_GRPC"); addr != "" {
+		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err == nil {
+			cfg.OpsConn = conn
+		} else {
+			logger.Error("pulse aggregator: dial ops %s: %v", addr, err)
+		}
 	}
+	if addr := os.Getenv("WORK_SERVICE_GRPC"); addr != "" {
+		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err == nil {
+			cfg.WorkConn = conn
+		} else {
+			logger.Error("pulse aggregator: dial work %s: %v", addr, err)
+		}
+	}
+	return cfg
 }
 
 // StartConsumers blocks; call in a goroutine.
