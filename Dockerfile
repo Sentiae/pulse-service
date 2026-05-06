@@ -7,6 +7,8 @@ WORKDIR /app
 
 # Copy local replace dependencies (from parent dir)
 COPY platform-kit/ /platform-kit/
+COPY ops-service/ /ops-service/
+COPY work-service/ /work-service/
 COPY pulse-service/ /pulse-service/
 
 WORKDIR /pulse-service
