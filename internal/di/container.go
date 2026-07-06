@@ -10,6 +10,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
 
@@ -205,8 +206,15 @@ func (c *Container) initHandlers() {
 // e.g. "ops-service:50051"). Missing env = nil conn = signal skipped.
 func loadAggregatorConfig() usecase.AggregatorConfig {
 	cfg := usecase.AggregatorConfig{}
+	// ops-service + work-service validate x-api-key on inbound gRPC. Attach it
+	// (via a dial-time client interceptor) to every outbound call so pulse
+	// isn't rejected once these addresses are configured.
+	apiKey := os.Getenv("APP_GRPC_SERVICE_API_KEY")
 	if addr := os.Getenv("OPS_SERVICE_GRPC"); addr != "" {
-		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := grpc.NewClient(addr,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithChainUnaryInterceptor(serviceAuthInterceptor(apiKey)),
+		)
 		if err == nil {
 			cfg.OpsConn = conn
 		} else {
@@ -214,7 +222,10 @@ func loadAggregatorConfig() usecase.AggregatorConfig {
 		}
 	}
 	if addr := os.Getenv("WORK_SERVICE_GRPC"); addr != "" {
-		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := grpc.NewClient(addr,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithChainUnaryInterceptor(serviceAuthInterceptor(apiKey)),
+		)
 		if err == nil {
 			cfg.WorkConn = conn
 		} else {
@@ -222,6 +233,33 @@ func loadAggregatorConfig() usecase.AggregatorConfig {
 		}
 	}
 	return cfg
+}
+
+// Service-to-service gRPC auth headers. ops-service + work-service validate
+// x-api-key on inbound calls; x-service-name is attribution only.
+const (
+	serviceAPIKeyHeader = "x-api-key"
+	serviceNameHeader   = "x-service-name"
+	pulseServiceName    = "pulse-service"
+)
+
+// serviceAuthInterceptor returns a unary client interceptor that attaches the
+// shared service API key + pulse's service-name to every outbound call, unless
+// the caller already supplied them. An empty apiKey (dev/compose where
+// downstream auth is disabled) makes the interceptor a no-op.
+func serviceAuthInterceptor(apiKey string) grpc.UnaryClientInterceptor {
+	return func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		if apiKey != "" {
+			md, _ := metadata.FromOutgoingContext(ctx)
+			if md.Get(serviceAPIKeyHeader) == nil {
+				ctx = metadata.AppendToOutgoingContext(ctx,
+					serviceAPIKeyHeader, apiKey,
+					serviceNameHeader, pulseServiceName,
+				)
+			}
+		}
+		return invoker(ctx, method, req, reply, cc, opts...)
+	}
 }
 
 // StartConsumers blocks; call in a goroutine.
