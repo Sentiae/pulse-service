@@ -8,8 +8,11 @@ import (
 	"strconv"
 	"time"
 
+	pkconfig "github.com/sentiae/platform-kit/config"
+	"github.com/sentiae/platform-kit/grpcclient"
+	"github.com/sentiae/platform-kit/spiffe"
+	"github.com/spiffe/go-spiffe/v2/workloadapi"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
@@ -42,6 +45,11 @@ type Container struct {
 
 	HTTPServer *httphandler.Server
 	Publisher  events.Publisher
+
+	// mtlsSource is the shared SPIFFE X509 source for pulse's outbound gRPC
+	// dials (Phase 2 mTLS mesh). Nil when APP_GRPC_MTLS_MODE is off or the
+	// workload API is unavailable — grpcclient.Dial then falls back to insecure.
+	mtlsSource *workloadapi.X509Source
 }
 
 // NewContainer constructs the container. It is the only place that knows
@@ -57,8 +65,24 @@ func NewContainer(cfg *config.Config) (*Container, error) {
 	if err := c.initConsumers(); err != nil {
 		return nil, fmt.Errorf("init consumers: %w", err)
 	}
+	c.initMTLSSource()
 	c.initHandlers()
 	return c, nil
+}
+
+// initMTLSSource builds the one shared SPIFFE X509 source for pulse's outbound
+// gRPC dials when APP_GRPC_MTLS_MODE is not off. On workload-API failure it
+// degrades to nil so grpcclient.Dial falls back to insecure.
+func (c *Container) initMTLSSource() {
+	if pkconfig.MTLSMode() == pkconfig.MTLSModeOff {
+		return
+	}
+	src, err := spiffe.NewSource(context.Background())
+	if err != nil {
+		logger.Error("SPIFFE client source unavailable, gRPC clients degrade to insecure: %v", err)
+		return
+	}
+	c.mtlsSource = src
 }
 
 func (c *Container) initDatabase() error {
@@ -193,7 +217,7 @@ func (c *Container) initHandlers() {
 	// Enabled when at least one OPS_SERVICE_GRPC / WORK_SERVICE_GRPC
 	// address is set. Fail-open: aggregator-less pulse still serves
 	// flow endpoints.
-	cfg := loadAggregatorConfig()
+	cfg := loadAggregatorConfig(c.mtlsSource)
 	if cfg.OpsConn != nil || cfg.WorkConn != nil {
 		c.Aggregator = usecase.NewAggregator(cfg)
 		c.HTTPServer.SetAggregator(c.Aggregator)
@@ -204,17 +228,20 @@ func (c *Container) initHandlers() {
 // loadAggregatorConfig dials gRPC connections to ops + work services
 // from env-configured addresses (OPS_SERVICE_GRPC / WORK_SERVICE_GRPC,
 // e.g. "ops-service:50051"). Missing env = nil conn = signal skipped.
-func loadAggregatorConfig() usecase.AggregatorConfig {
+func loadAggregatorConfig(src *workloadapi.X509Source) usecase.AggregatorConfig {
 	cfg := usecase.AggregatorConfig{}
 	// ops-service + work-service validate x-api-key on inbound gRPC. Attach it
 	// (via a dial-time client interceptor) to every outbound call so pulse
 	// isn't rejected once these addresses are configured.
 	apiKey := os.Getenv("APP_GRPC_SERVICE_API_KEY")
+	mode := pkconfig.MTLSMode()
 	if addr := os.Getenv("OPS_SERVICE_GRPC"); addr != "" {
-		conn, err := grpc.NewClient(addr,
-			grpc.WithTransportCredentials(insecure.NewCredentials()),
-			grpc.WithChainUnaryInterceptor(serviceAuthInterceptor(apiKey)),
-		)
+		conn, err := grpcclient.Dial(context.Background(), grpcclient.Config{
+			Endpoint:      addr,
+			Mode:          mode,
+			Source:        src,
+			ServerService: "ops",
+		}, grpc.WithChainUnaryInterceptor(serviceAuthInterceptor(apiKey)))
 		if err == nil {
 			cfg.OpsConn = conn
 		} else {
@@ -222,10 +249,12 @@ func loadAggregatorConfig() usecase.AggregatorConfig {
 		}
 	}
 	if addr := os.Getenv("WORK_SERVICE_GRPC"); addr != "" {
-		conn, err := grpc.NewClient(addr,
-			grpc.WithTransportCredentials(insecure.NewCredentials()),
-			grpc.WithChainUnaryInterceptor(serviceAuthInterceptor(apiKey)),
-		)
+		conn, err := grpcclient.Dial(context.Background(), grpcclient.Config{
+			Endpoint:      addr,
+			Mode:          mode,
+			Source:        src,
+			ServerService: "work",
+		}, grpc.WithChainUnaryInterceptor(serviceAuthInterceptor(apiKey)))
 		if err == nil {
 			cfg.WorkConn = conn
 		} else {
@@ -335,5 +364,8 @@ func (c *Container) Close() {
 		if sqlDB, err := c.DB.DB(); err == nil {
 			_ = sqlDB.Close()
 		}
+	}
+	if c.mtlsSource != nil {
+		_ = c.mtlsSource.Close()
 	}
 }

@@ -9,12 +9,14 @@ require (
 	github.com/sentiae/ops-service v0.0.0-20260425161100-c8f10a8df4ac
 	github.com/sentiae/platform-kit v0.1.0
 	github.com/sentiae/work-service v0.4.0
+	github.com/spiffe/go-spiffe/v2 v2.6.0
 	google.golang.org/grpc v1.81.1
 	gorm.io/driver/postgres v1.6.0
 	gorm.io/gorm v1.31.2
 )
 
 require (
+	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
