@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -16,6 +17,7 @@ type Config struct {
 	Database  DatabaseConfig  `mapstructure:"database"`
 	Messaging MessagingConfig `mapstructure:"messaging"`
 	Features  FeaturesConfig  `mapstructure:"features"`
+	Security  SecurityConfig  `mapstructure:"security"`
 }
 
 type AppConfig struct {
@@ -61,14 +63,20 @@ type DatabaseConfig struct {
 }
 
 type PostgresConfig struct {
-	Host     string     `mapstructure:"host"`
-	Port     string     `mapstructure:"port"`
-	User     string     `mapstructure:"user"`
-	Password string     `mapstructure:"password"`
-	Database string     `mapstructure:"database"`
-	SSLMode  string     `mapstructure:"ssl_mode"`
-	Pool     PoolConfig `mapstructure:"pool"`
-	LogLevel string     `mapstructure:"log_level"`
+	Host     string `mapstructure:"host"`
+	Port     string `mapstructure:"port"`
+	User     string `mapstructure:"user"`
+	Password string `mapstructure:"password"`
+	// MigrateUser/MigratePassword are the OWNER role credentials used for the
+	// short-lived schema-DDL connection (renames + AutoMigrate + RLS objects) in
+	// the D-070 role split. Empty -> falls back to User/Password, so an unsplit
+	// deploy behaves exactly as before (one effective role).
+	MigrateUser     string     `mapstructure:"migrate_user"`
+	MigratePassword string     `mapstructure:"migrate_password"`
+	Database        string     `mapstructure:"database"`
+	SSLMode         string     `mapstructure:"ssl_mode"`
+	Pool            PoolConfig `mapstructure:"pool"`
+	LogLevel        string     `mapstructure:"log_level"`
 }
 
 type PoolConfig struct {
@@ -97,6 +105,21 @@ type KafkaTopicsConfig struct {
 
 type FeaturesConfig struct {
 	EventPublishing bool `mapstructure:"event_publishing"`
+}
+
+// SecurityConfig contains security settings
+type SecurityConfig struct {
+	Auth AuthConfig `mapstructure:"auth"`
+}
+
+// AuthConfig carries the service-to-service + user-token verification settings
+// for the gRPC auth interceptor (platform-kit tenant). ServiceAPIKey is the
+// shared x-api-key secret validated against inbound service callers; JWKSURL +
+// JWTIssuer configure the JWKS-backed user-token validator.
+type AuthConfig struct {
+	ServiceAPIKey string `mapstructure:"service_api_key"`
+	JWKSURL       string `mapstructure:"jwks_url"`
+	JWTIssuer     string `mapstructure:"jwt_issuer"`
 }
 
 func Load() (*Config, error) {
@@ -130,6 +153,8 @@ func Load() (*Config, error) {
 			"database.postgres.port":                "5432",
 			"database.postgres.user":                "postgres",
 			"database.postgres.password":            "postgres",
+			"database.postgres.migrate_user":        "",
+			"database.postgres.migrate_password":    "",
 			"database.postgres.database":            "pulse_service",
 			"database.postgres.ssl_mode":            "disable",
 			"database.postgres.pool.max_open_conns": 25,
@@ -146,6 +171,10 @@ func Load() (*Config, error) {
 			"messaging.kafka.topics.pulse_events": "sentiae.pulse.events",
 
 			"features.event_publishing": true,
+
+			// Security - gRPC auth interceptor (service token + JWKS user token)
+			"security.auth.jwks_url":   "http://identity-service:8080/.well-known/jwks.json",
+			"security.auth.jwt_issuer": "identity-service",
 		},
 		BindEnvs: [][2]string{
 			{"app.name", "APP_APP_NAME"},
@@ -161,6 +190,8 @@ func Load() (*Config, error) {
 			{"database.postgres.port", "APP_DATABASE_PORT"},
 			{"database.postgres.user", "APP_DATABASE_USER"},
 			{"database.postgres.password", "APP_DATABASE_PASSWORD"},
+			{"database.postgres.migrate_user", "APP_DATABASE_MIGRATE_USER"},
+			{"database.postgres.migrate_password", "APP_DATABASE_MIGRATE_PASSWORD"},
 			{"database.postgres.database", "APP_DATABASE_NAME"},
 			{"database.postgres.ssl_mode", "APP_DATABASE_SSL_MODE"},
 
@@ -169,6 +200,10 @@ func Load() (*Config, error) {
 			{"messaging.kafka.client_id", "APP_KAFKA_CLIENT_ID"},
 			{"messaging.kafka.group_id", "APP_KAFKA_GROUP_ID"},
 			{"messaging.kafka.topics.prefix", "APP_KAFKA_TOPIC_PREFIX"},
+
+			{"security.auth.service_api_key", "APP_GRPC_SERVICE_API_KEY"},
+			{"security.auth.jwks_url", "APP_AUTH_JWKS_URL"},
+			{"security.auth.jwt_issuer", "APP_AUTH_JWT_ISSUER"},
 
 			{"features.event_publishing", "APP_FEATURES_EVENT_PUBLISHING"},
 		},
@@ -188,4 +223,20 @@ func (c *Config) GetDatabaseURL() string {
 
 func (c *Config) GetKafkaBrokers() []string {
 	return strings.Split(c.Messaging.Kafka.Brokers, ",")
+}
+
+// RLSStampEnabled gates the P4 RLS object apply (ApplyRLSObjects) at boot. Read
+// from APP_RLS_STAMP_ENABLED; unset or any non-"true" value returns false, so RLS
+// stays a no-op until it is explicitly switched on for the flip (D-070). Mirrors
+// work-service config.RLSStampEnabled().
+func RLSStampEnabled() bool {
+	return strings.EqualFold(strings.TrimSpace(os.Getenv("APP_RLS_STAMP_ENABLED")), "true")
+}
+
+// RLSEnforceEnabled gates the read-path RLS enforcement (the tenantdb.Enforce GORM
+// plugin + boot posture assertion), wired in a later task. Read from
+// APP_RLS_ENFORCE_ENABLED; unset or any non-"true" value returns false. Kept OFF
+// during shadow, flipped ON alongside the non-owner app role at go-live (D-071).
+func RLSEnforceEnabled() bool {
+	return strings.EqualFold(strings.TrimSpace(os.Getenv("APP_RLS_ENFORCE_ENABLED")), "true")
 }

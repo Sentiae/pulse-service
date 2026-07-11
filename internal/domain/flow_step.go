@@ -20,9 +20,10 @@ const (
 // Each incoming saga event that's not the start event becomes a FlowStep
 // attached to its parent Flow.
 type FlowStep struct {
-	ID          uuid.UUID      `gorm:"type:uuid;primaryKey" json:"id"`
-	FlowID      uuid.UUID      `gorm:"type:uuid;not null;index" json:"flow_id"`
-	StepName    string         `gorm:"size:128;not null" json:"step_name"`
+	ID             uuid.UUID      `gorm:"type:uuid;primaryKey" json:"id"`
+	FlowID         uuid.UUID      `gorm:"type:uuid;not null;index" json:"flow_id"`
+	OrganizationID uuid.UUID      `gorm:"type:uuid;index" json:"organization_id"`
+	StepName       string         `gorm:"size:128;not null" json:"step_name"`
 	Service     string         `gorm:"size:64;not null" json:"service"`
 	EventType   string         `gorm:"size:128;not null" json:"event_type"`
 	Status      FlowStepStatus `gorm:"size:32;not null" json:"status"`
@@ -57,7 +58,7 @@ type EventAudit struct {
 	SourceService  string    `gorm:"size:64;index:idx_audit_source_service" json:"source_service,omitempty"`
 	ResourceType   string    `gorm:"size:64;index:idx_audit_resource_type" json:"resource_type,omitempty"`
 	ResourceID     string    `gorm:"size:128;index:idx_audit_resource_id" json:"resource_id,omitempty"`
-	OrganizationID string    `gorm:"size:64;index:idx_audit_org" json:"organization_id,omitempty"`
+	OrganizationID uuid.UUID `gorm:"type:uuid;index:idx_audit_org" json:"organization_id"`
 	ActorID        string    `gorm:"size:64;index:idx_audit_actor" json:"actor_id,omitempty"`
 	OccurredAt     time.Time `gorm:"not null;index:idx_audit_occurred_at" json:"occurred_at"`
 	Payload        string    `gorm:"type:jsonb" json:"payload"`

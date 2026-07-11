@@ -12,6 +12,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 
+	pkgmiddleware "github.com/sentiae/platform-kit/middleware"
+
 	"github.com/sentiae/pulse-service/internal/domain"
 	"github.com/sentiae/pulse-service/internal/repository/postgres"
 	"github.com/sentiae/pulse-service/internal/usecase"
@@ -21,6 +23,9 @@ import (
 // Server wires the REST + WebSocket surface of pulse-service.
 type Server struct {
 	router        chi.Router
+	jwks          pkgmiddleware.TokenValidator
+	serviceAPIKey string
+	orgResolver   OrgResolver
 	tracker       *usecase.FlowTracker
 	recorder      *usecase.AuditRecorder
 	aggregator    *usecase.Aggregator
@@ -29,10 +34,19 @@ type Server struct {
 	wsUp          websocket.Upgrader
 }
 
-func NewServer(tracker *usecase.FlowTracker, recorder *usecase.AuditRecorder) *Server {
+func NewServer(
+	jwks pkgmiddleware.TokenValidator,
+	serviceAPIKey string,
+	orgResolver OrgResolver,
+	tracker *usecase.FlowTracker,
+	recorder *usecase.AuditRecorder,
+) *Server {
 	s := &Server{
-		tracker:  tracker,
-		recorder: recorder,
+		jwks:          jwks,
+		serviceAPIKey: serviceAPIKey,
+		orgResolver:   orgResolver,
+		tracker:       tracker,
+		recorder:      recorder,
 		wsUp: websocket.Upgrader{
 			// Pulse is behind the BFF in production; accept all origins in
 			// dev and let the BFF enforce origin checks.
@@ -74,7 +88,12 @@ func (s *Server) setupRoutes() {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 	})
 
+	// Authenticated surface. authMiddleware runs first so every route below
+	// requires a valid Bearer JWT (→ user principal) or x-api-key (→ service
+	// principal); /health + /ready above stay open. Handlers stamp the active
+	// org (D-073) before any RLS-forced read.
 	r.Route("/api/v1/pulse", func(r chi.Router) {
+		r.Use(s.authMiddleware)
 		r.Get("/flows", s.listFlows)
 		r.Get("/flows/active", s.listActiveFlows)
 		r.Get("/flows/stats", s.flowStats)
@@ -96,6 +115,7 @@ func (s *Server) setupRoutes() {
 	// Platform-wide audit log endpoints. Mounted at /audit so callers
 	// don't confuse them with the saga-scoped /flows endpoints.
 	r.Route("/audit", func(r chi.Router) {
+		r.Use(s.authMiddleware)
 		r.Get("/events", s.listAuditEvents)
 		r.Get("/events/{id}", s.getAuditEvent)
 		r.Post("/replay", s.replayAudit)
@@ -115,13 +135,20 @@ func (s *Server) listAuditEvents(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit recorder not enabled"})
 		return
 	}
+	org, ctx, err := orgFromRequest(r)
+	if err != nil {
+		respondOrgError(w, err)
+		return
+	}
 	q := r.URL.Query()
 	filter := postgres.AuditFilter{
-		EventType:      q.Get("event_type"),
-		Domain:         q.Get("domain"),
-		SourceService:  q.Get("service"),
-		ResourceID:     q.Get("resource_id"),
-		OrganizationID: q.Get("org_id"),
+		EventType:     q.Get("event_type"),
+		Domain:        q.Get("domain"),
+		SourceService: q.Get("service"),
+		ResourceID:    q.Get("resource_id"),
+		// Force the org field to the stamped org — never trust the raw query
+		// param for tenant scoping (belt-and-braces with RLS).
+		OrganizationID: org.String(),
 		ActorID:        q.Get("actor_id"),
 	}
 	if v := q.Get("from"); v != "" {
@@ -144,7 +171,7 @@ func (s *Server) listAuditEvents(w http.ResponseWriter, r *http.Request) {
 			filter.Offset = n
 		}
 	}
-	rows, err := s.recorder.ListAudit(r.Context(), filter)
+	rows, err := s.recorder.ListAudit(ctx, filter)
 	if err != nil {
 		httpError(w, err)
 		return
@@ -163,7 +190,12 @@ func (s *Server) getAuditEvent(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid id"})
 		return
 	}
-	row, err := s.recorder.GetAudit(r.Context(), id)
+	ctx, err := s.stampAuditOrg(r.Context(), id)
+	if err != nil {
+		respondOrgError(w, err)
+		return
+	}
+	row, err := s.recorder.GetAudit(ctx, id)
 	if err != nil {
 		httpError(w, err)
 		return
@@ -178,12 +210,17 @@ func (s *Server) replayAudit(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "audit recorder not enabled"})
 		return
 	}
+	_, ctx, err := orgFromRequest(r)
+	if err != nil {
+		respondOrgError(w, err)
+		return
+	}
 	var req usecase.ReplayRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 		return
 	}
-	n, err := s.recorder.ReplayBatch(r.Context(), req)
+	n, err := s.recorder.ReplayBatch(ctx, req)
 	if err != nil {
 		httpError(w, err)
 		return
@@ -192,6 +229,11 @@ func (s *Server) replayAudit(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listFlows(w http.ResponseWriter, r *http.Request) {
+	_, ctx, err := orgFromRequest(r)
+	if err != nil {
+		respondOrgError(w, err)
+		return
+	}
 	filter := postgres.ListFlowsFilter{}
 	switch r.URL.Query().Get("state") {
 	case "active":
@@ -204,7 +246,7 @@ func (s *Server) listFlows(w http.ResponseWriter, r *http.Request) {
 	if k := r.URL.Query().Get("kind"); k != "" {
 		filter.Kind = domain.FlowKind(k)
 	}
-	flows, err := s.tracker.ListFlows(r.Context(), filter)
+	flows, err := s.tracker.ListFlows(ctx, filter)
 	if err != nil {
 		httpError(w, err)
 		return
@@ -213,7 +255,12 @@ func (s *Server) listFlows(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listActiveFlows(w http.ResponseWriter, r *http.Request) {
-	flows, err := s.tracker.ListFlows(r.Context(), postgres.ListFlowsFilter{State: postgres.FilterActive})
+	_, ctx, err := orgFromRequest(r)
+	if err != nil {
+		respondOrgError(w, err)
+		return
+	}
+	flows, err := s.tracker.ListFlows(ctx, postgres.ListFlowsFilter{State: postgres.FilterActive})
 	if err != nil {
 		httpError(w, err)
 		return
@@ -222,7 +269,12 @@ func (s *Server) listActiveFlows(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) flowStats(w http.ResponseWriter, r *http.Request) {
-	stats, err := s.tracker.Stats(r.Context())
+	_, ctx, err := orgFromRequest(r)
+	if err != nil {
+		respondOrgError(w, err)
+		return
+	}
+	stats, err := s.tracker.Stats(ctx)
 	if err != nil {
 		httpError(w, err)
 		return
@@ -241,12 +293,12 @@ func (s *Server) pulseSummary(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	orgID := r.URL.Query().Get("org_id")
-	if orgID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "org_id is required"})
+	org, ctx, err := orgFromRequest(r)
+	if err != nil {
+		respondOrgError(w, err)
 		return
 	}
-	snap, err := s.aggregator.GetSnapshot(r.Context(), orgID)
+	snap, err := s.aggregator.GetSnapshot(ctx, org.String())
 	if err != nil {
 		httpError(w, err)
 		return
@@ -260,7 +312,12 @@ func (s *Server) getFlow(w http.ResponseWriter, r *http.Request) {
 		httpError(w, err)
 		return
 	}
-	flow, err := s.tracker.GetFlow(r.Context(), id)
+	ctx, err := s.stampFlowOrg(r.Context(), id)
+	if err != nil {
+		respondOrgError(w, err)
+		return
+	}
+	flow, err := s.tracker.GetFlow(ctx, id)
 	if err != nil {
 		httpError(w, err)
 		return
@@ -274,7 +331,12 @@ func (s *Server) replayFlow(w http.ResponseWriter, r *http.Request) {
 		httpError(w, err)
 		return
 	}
-	count, err := s.tracker.Replay(r.Context(), id)
+	ctx, err := s.stampFlowOrg(r.Context(), id)
+	if err != nil {
+		respondOrgError(w, err)
+		return
+	}
+	count, err := s.tracker.Replay(ctx, id)
 	if err != nil {
 		httpError(w, err)
 		return
@@ -283,7 +345,16 @@ func (s *Server) replayFlow(w http.ResponseWriter, r *http.Request) {
 }
 
 // streamFlows upgrades to a WebSocket and pushes each flow update as JSON.
+// Auth + org resolution happen BEFORE the upgrade so an unauthorized caller
+// never gets a socket; every pushed flow is dropped unless its OrganizationID
+// matches the active org (strict — sentinel/platform flows are not streamed).
 func (s *Server) streamFlows(w http.ResponseWriter, r *http.Request) {
+	activeOrg, _, err := orgFromRequest(r)
+	if err != nil {
+		respondOrgError(w, err)
+		return
+	}
+
 	conn, err := s.wsUp.Upgrade(w, r, nil)
 	if err != nil {
 		logger.Error("ws upgrade failed: %v", err)
@@ -314,6 +385,9 @@ func (s *Server) streamFlows(w http.ResponseWriter, r *http.Request) {
 		case flow, ok := <-ch:
 			if !ok {
 				return
+			}
+			if flow.OrganizationID != activeOrg {
+				continue
 			}
 			if err := conn.WriteJSON(flowJSON(flow)); err != nil {
 				return
@@ -377,17 +451,20 @@ func (s *Server) listAlertActivity(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "alert tracker not configured"})
 		return
 	}
-	org := r.URL.Query().Get("org_id")
-	snap := s.alertTracker.Snapshot()
-	if org != "" {
-		filtered := snap[:0]
-		for _, e := range snap {
-			if e.OrgID == "" || e.OrgID == org {
-				filtered = append(filtered, e)
-			}
-		}
-		snap = filtered
+	orgID, _, err := orgFromRequest(r)
+	if err != nil {
+		respondOrgError(w, err)
+		return
 	}
+	org := orgID.String()
+	snap := s.alertTracker.Snapshot()
+	filtered := snap[:0]
+	for _, e := range snap {
+		if e.OrgID == "" || e.OrgID == org {
+			filtered = append(filtered, e)
+		}
+	}
+	snap = filtered
 	writeJSON(w, http.StatusOK, map[string]any{"entries": snap})
 }
 
@@ -399,7 +476,12 @@ func (s *Server) streamAlertActivity(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "alert tracker not configured"})
 		return
 	}
-	org := r.URL.Query().Get("org_id")
+	orgID, _, err := orgFromRequest(r)
+	if err != nil {
+		respondOrgError(w, err)
+		return
+	}
+	org := orgID.String()
 
 	conn, err := s.wsUp.Upgrade(w, r, nil)
 	if err != nil {
@@ -414,7 +496,7 @@ func (s *Server) streamAlertActivity(w http.ResponseWriter, r *http.Request) {
 	// Push the current snapshot first so subscribers don't stare at an
 	// empty strip for the first live update.
 	for _, e := range s.alertTracker.Snapshot() {
-		if org != "" && e.OrgID != "" && e.OrgID != org {
+		if e.OrgID != "" && e.OrgID != org {
 			continue
 		}
 		if err := conn.WriteJSON(e); err != nil {
@@ -442,7 +524,7 @@ func (s *Server) streamAlertActivity(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			if org != "" && entry.OrgID != "" && entry.OrgID != org {
+			if entry.OrgID != "" && entry.OrgID != org {
 				continue
 			}
 			if err := conn.WriteJSON(entry); err != nil {
@@ -459,17 +541,20 @@ func (s *Server) listDeployActivity(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "deploy tracker not configured"})
 		return
 	}
-	org := r.URL.Query().Get("org_id")
-	snap := s.deployTracker.Snapshot()
-	if org != "" {
-		filtered := snap[:0]
-		for _, e := range snap {
-			if e.OrgID == "" || e.OrgID == org {
-				filtered = append(filtered, e)
-			}
-		}
-		snap = filtered
+	orgID, _, err := orgFromRequest(r)
+	if err != nil {
+		respondOrgError(w, err)
+		return
 	}
+	org := orgID.String()
+	snap := s.deployTracker.Snapshot()
+	filtered := snap[:0]
+	for _, e := range snap {
+		if e.OrgID == "" || e.OrgID == org {
+			filtered = append(filtered, e)
+		}
+	}
+	snap = filtered
 	writeJSON(w, http.StatusOK, map[string]any{"entries": snap})
 }
 
@@ -479,7 +564,12 @@ func (s *Server) streamDeployActivity(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "deploy tracker not configured"})
 		return
 	}
-	org := r.URL.Query().Get("org_id")
+	orgID, _, err := orgFromRequest(r)
+	if err != nil {
+		respondOrgError(w, err)
+		return
+	}
+	org := orgID.String()
 
 	conn, err := s.wsUp.Upgrade(w, r, nil)
 	if err != nil {
@@ -492,7 +582,7 @@ func (s *Server) streamDeployActivity(w http.ResponseWriter, r *http.Request) {
 	defer s.deployTracker.Unsubscribe(subID)
 
 	for _, e := range s.deployTracker.Snapshot() {
-		if org != "" && e.OrgID != "" && e.OrgID != org {
+		if e.OrgID != "" && e.OrgID != org {
 			continue
 		}
 		if err := conn.WriteJSON(e); err != nil {
@@ -520,7 +610,7 @@ func (s *Server) streamDeployActivity(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
-			if org != "" && entry.OrgID != "" && entry.OrgID != org {
+			if entry.OrgID != "" && entry.OrgID != org {
 				continue
 			}
 			if err := conn.WriteJSON(entry); err != nil {

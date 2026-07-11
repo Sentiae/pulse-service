@@ -10,7 +10,10 @@ import (
 
 	pkconfig "github.com/sentiae/platform-kit/config"
 	"github.com/sentiae/platform-kit/grpcclient"
+	pkgmiddleware "github.com/sentiae/platform-kit/middleware"
 	"github.com/sentiae/platform-kit/spiffe"
+	"github.com/sentiae/platform-kit/tenant"
+	"github.com/sentiae/platform-kit/tenantdb"
 	"github.com/spiffe/go-spiffe/v2/workloadapi"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
@@ -38,6 +41,15 @@ type Container struct {
 	AlertTracker  *usecase.AlertTracker
 	DeployTracker *usecase.DeployTracker
 
+	// TenantResolver resolves owning orgs via the D-072 SECURITY DEFINER rls_*
+	// functions; the SagaOrgResolver for FlowTracker and the OrgResolver for the
+	// HTTP by-id handlers. Built on the app pool.
+	TenantResolver *postgres.TenantResolverRepo
+
+	// JWKSValidator validates BFF-forwarded user Bearer tokens for the HTTP auth
+	// middleware (D-073). Nil when RLS enforcement is off and JWKS is unavailable.
+	JWKSValidator pkgmiddleware.TokenValidator
+
 	FlowConsumer           *messaging.FlowConsumer
 	AuditConsumer          *messaging.AuditConsumer
 	AlertActivityConsumer  *messaging.AlertActivityConsumer
@@ -58,6 +70,9 @@ func NewContainer(cfg *config.Config) (*Container, error) {
 	c := &Container{Config: cfg}
 	if err := c.initDatabase(); err != nil {
 		return nil, fmt.Errorf("init database: %w", err)
+	}
+	if err := c.initAuth(); err != nil {
+		return nil, fmt.Errorf("init auth: %w", err)
 	}
 	c.initInfrastructure()
 	c.initRepositories()
@@ -99,13 +114,64 @@ func (c *Container) initDatabase() error {
 	case "silent":
 		logLevel = gormlogger.Silent
 	}
-	db, err := postgres.NewDB(postgres.Config{
-		Host:     c.Config.Database.Postgres.Host,
+	pg := c.Config.Database.Postgres
+
+	// OWNER connection for schema DDL (pre-migrate retype + AutoMigrate + RLS
+	// objects) — D-070 role split. Uses MigrateUser/MigratePassword when set, else
+	// falls back to the app creds so an unsplit deploy connects as the same role as
+	// before. Short-lived and closed immediately after schema setup so no
+	// DDL-capable pool lingers.
+	ownerUser, ownerPassword := pg.User, pg.Password
+	if pg.MigrateUser != "" {
+		ownerUser, ownerPassword = pg.MigrateUser, pg.MigratePassword
+	}
+	ownerDB, err := postgres.NewDB(postgres.Config{
+		Host:     pg.Host,
 		Port:     port,
-		User:     c.Config.Database.Postgres.User,
-		Password: c.Config.Database.Postgres.Password,
-		Database: c.Config.Database.Postgres.Database,
-		SSLMode:  c.Config.Database.Postgres.SSLMode,
+		User:     ownerUser,
+		Password: ownerPassword,
+		Database: pg.Database,
+		SSLMode:  pg.SSLMode,
+		LogLevel: logLevel,
+	})
+	if err != nil {
+		return fmt.Errorf("open owner connection: %w", err)
+	}
+
+	// Pre-migrate (UNCONDITIONAL): retype the legacy varchar organization_id
+	// columns to uuid BEFORE AutoMigrate sees the uuid struct field. Idempotent and
+	// a no-op once the columns are already uuid → behavior-neutral in shadow.
+	if err := postgres.ApplyPreMigrate(ownerDB); err != nil {
+		closeOwnerDB(ownerDB)
+		return fmt.Errorf("apply pre-migrate: %w", err)
+	}
+
+	// Auto-migrate domain models on the OWNER connection.
+	if err := postgres.AutoMigrate(ownerDB); err != nil {
+		closeOwnerDB(ownerDB)
+		return fmt.Errorf("auto-migrate: %w", err)
+	}
+
+	// RLS objects (org denormalization + backfill, tenant_isolation policies,
+	// SECURITY DEFINER org resolvers), flag-gated. Skipped when APP_RLS_STAMP_ENABLED
+	// is off → behavior-neutral shadow (no objects created).
+	if config.RLSStampEnabled() {
+		if err := postgres.ApplyRLSObjects(ownerDB); err != nil {
+			closeOwnerDB(ownerDB)
+			return fmt.Errorf("apply RLS objects: %w", err)
+		}
+		logger.Info("RLS objects applied (policies + org-resolver fns)")
+	}
+	closeOwnerDB(ownerDB)
+
+	// APP pool (long-lived). Post-flip these are the NOBYPASSRLS app creds.
+	db, err := postgres.NewDB(postgres.Config{
+		Host:     pg.Host,
+		Port:     port,
+		User:     pg.User,
+		Password: pg.Password,
+		Database: pg.Database,
+		SSLMode:  pg.SSLMode,
 		LogLevel: logLevel,
 	})
 	if err != nil {
@@ -115,15 +181,64 @@ func (c *Container) initDatabase() error {
 	if err != nil {
 		return err
 	}
-	sqlDB.SetMaxOpenConns(c.Config.Database.Postgres.Pool.MaxOpenConns)
-	sqlDB.SetMaxIdleConns(c.Config.Database.Postgres.Pool.MaxIdleConns)
-	sqlDB.SetConnMaxLifetime(c.Config.Database.Postgres.Pool.MaxLifetime)
-	sqlDB.SetConnMaxIdleTime(c.Config.Database.Postgres.Pool.MaxIdleTime)
+	sqlDB.SetMaxOpenConns(pg.Pool.MaxOpenConns)
+	sqlDB.SetMaxIdleConns(pg.Pool.MaxIdleConns)
+	sqlDB.SetConnMaxLifetime(pg.Pool.MaxLifetime)
+	sqlDB.SetConnMaxIdleTime(pg.Pool.MaxIdleTime)
 	c.DB = db
-	if err := postgres.AutoMigrate(db); err != nil {
-		return fmt.Errorf("auto-migrate: %w", err)
+
+	// P4 RLS read-path enforcement (D-071), flag-gated. Registering the Enforce
+	// plugin auto-stamps every non-tx statement with the acting org; the boot
+	// posture assertion then fails LOUD if enforcement is on while the app pool
+	// still connects as a BYPASSRLS/superuser role. Registration BEFORE assertion.
+	// Flag off → not registered → behavior-neutral shadow.
+	if config.RLSEnforceEnabled() {
+		if err := db.Use(tenantdb.Enforce()); err != nil {
+			return fmt.Errorf("register RLS enforce plugin: %w", err)
+		}
+		logger.Info("RLS Enforce plugin registered on app pool (read-path enforcement ON)")
+		if err := tenantdb.AssertPosture(db, tenantdb.PostureEnforced); err != nil {
+			return fmt.Errorf("RLS boot posture assertion failed: %w", err)
+		}
+		logger.Info("RLS boot posture verified (app role is RLS-enforced)")
 	}
+
 	logger.Info("Database connected and migrated")
+	return nil
+}
+
+// closeOwnerDB closes the underlying *sql.DB of the short-lived owner gorm
+// connection after schema setup, ignoring errors.
+func closeOwnerDB(db *gorm.DB) {
+	if sqlDB, err := db.DB(); err == nil {
+		_ = sqlDB.Close()
+	}
+}
+
+// initAuth builds the JWKS-backed user-token validator for the HTTP auth
+// middleware (D-073). Fail-boot when RLS enforcement is ON and JWKS is empty or
+// the validator build fails (a silently auth-off service reverts to the
+// cross-tenant leak). When enforcement is OFF an unavailable validator degrades
+// to nil (auth disabled, behavior-neutral shadow).
+func (c *Container) initAuth() error {
+	jwks, err := tenant.NewJWKSValidator(tenant.JWKSConfig{
+		JWKSURL: c.Config.Security.Auth.JWKSURL,
+		Issuer:  c.Config.Security.Auth.JWTIssuer,
+	})
+	if config.RLSEnforceEnabled() {
+		if c.Config.Security.Auth.JWKSURL == "" {
+			return fmt.Errorf("RLS enforcement is on but APP_AUTH_JWKS_URL is empty: refusing to boot without user-JWT validation (D-073)")
+		}
+		if err != nil {
+			return fmt.Errorf("RLS enforcement is on but building the JWKS validator failed: %w (D-073)", err)
+		}
+	} else if err != nil {
+		logger.Warn("JWKS validator unavailable; HTTP JWT auth disabled (RLS enforcement off): %v", err)
+		c.JWKSValidator = nil
+		return nil
+	}
+	logger.Info("HTTP JWT auth enabled via JWKS (issuer: %s)", c.Config.Security.Auth.JWTIssuer)
+	c.JWKSValidator = jwks
 	return nil
 }
 
@@ -141,10 +256,14 @@ func (c *Container) initInfrastructure() {
 
 func (c *Container) initRepositories() {
 	c.FlowRepo = postgres.NewFlowRepository(c.DB)
+	// Org resolver (D-072) — built on the app pool; the SagaOrgResolver for
+	// FlowTracker and the OrgResolver for the HTTP by-id handlers. Constructed
+	// BEFORE initUseCases so FlowTracker receives it.
+	c.TenantResolver = postgres.NewTenantResolverRepo(c.DB)
 }
 
 func (c *Container) initUseCases() {
-	c.FlowTracker = usecase.NewFlowTracker(c.FlowRepo, c.Publisher)
+	c.FlowTracker = usecase.NewFlowTracker(c.FlowRepo, c.Publisher, c.TenantResolver)
 	c.AuditRecorder = usecase.NewAuditRecorder(c.FlowRepo, c.Publisher)
 	c.AlertTracker = usecase.NewAlertTracker()
 	c.DeployTracker = usecase.NewDeployTracker()
@@ -211,7 +330,13 @@ func (c *Container) initConsumers() error {
 }
 
 func (c *Container) initHandlers() {
-	c.HTTPServer = httphandler.NewServer(c.FlowTracker, c.AuditRecorder)
+	c.HTTPServer = httphandler.NewServer(
+		c.JWKSValidator,
+		c.Config.Security.Auth.ServiceAPIKey,
+		c.TenantResolver,
+		c.FlowTracker,
+		c.AuditRecorder,
+	)
 	c.HTTPServer.SetActivityTrackers(c.AlertTracker, c.DeployTracker)
 	// §3 Pulse aggregator — gRPC fan-out to ops + work services.
 	// Enabled when at least one OPS_SERVICE_GRPC / WORK_SERVICE_GRPC

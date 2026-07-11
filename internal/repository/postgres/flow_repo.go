@@ -8,6 +8,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
+	"github.com/sentiae/platform-kit/tenantdb"
 	"github.com/sentiae/pulse-service/internal/domain"
 )
 
@@ -244,15 +245,20 @@ type Stats struct {
 func (r *FlowRepository) Stats(ctx context.Context) (*Stats, error) {
 	out := &Stats{ActiveByKind: map[string]int64{}}
 
+	// These are aggregate (Group/Select/Scan) reads: they route through GORM's
+	// Row processor, so under FORCE-RLS they must run inside a stamped tx or the
+	// tenantdb Enforce plugin fails them closed with ErrCursorOutsideTx (D-076).
+	// tenantdb.ReadScoped wraps each in a stamped transaction.
 	counts := []struct {
 		State domain.FlowState
 		N     int64
 	}{}
-	if err := r.db.WithContext(ctx).
-		Model(&domain.Flow{}).
-		Select("state, count(*) as n").
-		Group("state").
-		Scan(&counts).Error; err != nil {
+	if err := tenantdb.ReadScoped(ctx, r.db, func(tx *gorm.DB) error {
+		return tx.Model(&domain.Flow{}).
+			Select("state, count(*) as n").
+			Group("state").
+			Scan(&counts).Error
+	}); err != nil {
 		return nil, err
 	}
 	for _, c := range counts {
@@ -270,12 +276,13 @@ func (r *FlowRepository) Stats(ctx context.Context) (*Stats, error) {
 		Kind string
 		N    int64
 	}{}
-	if err := r.db.WithContext(ctx).
-		Model(&domain.Flow{}).
-		Select("kind, count(*) as n").
-		Where("state = ?", domain.FlowStateRunning).
-		Group("kind").
-		Scan(&byKind).Error; err != nil {
+	if err := tenantdb.ReadScoped(ctx, r.db, func(tx *gorm.DB) error {
+		return tx.Model(&domain.Flow{}).
+			Select("kind, count(*) as n").
+			Where("state = ?", domain.FlowStateRunning).
+			Group("kind").
+			Scan(&byKind).Error
+	}); err != nil {
 		return nil, err
 	}
 	for _, c := range byKind {
@@ -283,11 +290,12 @@ func (r *FlowRepository) Stats(ctx context.Context) (*Stats, error) {
 	}
 
 	row := struct{ Avg float64 }{}
-	if err := r.db.WithContext(ctx).
-		Model(&domain.Flow{}).
-		Select("coalesce(avg(duration_ms), 0) as avg").
-		Where("state = ? AND duration_ms > 0", domain.FlowStateCompleted).
-		Scan(&row).Error; err != nil {
+	if err := tenantdb.ReadScoped(ctx, r.db, func(tx *gorm.DB) error {
+		return tx.Model(&domain.Flow{}).
+			Select("coalesce(avg(duration_ms), 0) as avg").
+			Where("state = ? AND duration_ms > 0", domain.FlowStateCompleted).
+			Scan(&row).Error
+	}); err != nil {
 		return nil, err
 	}
 	out.AvgDurationMS = int64(row.Avg)

@@ -40,6 +40,12 @@ var (
 	ErrAuditNotFound = errors.New("audit event not found")
 )
 
+// PlatformSentinelOrg is the platform sentinel organization id used to stamp
+// org-less platform events (flows / audit rows whose CloudEvent carries no org
+// and whose saga has no resolvable owner). It is invisible to tenants under RLS
+// and excluded from the rls_org_ids() enumerator.
+var PlatformSentinelOrg = uuid.MustParse("00000000-0000-0000-0000-000000000001")
+
 // Flow is a single in-flight (or completed) cross-service flow.
 //
 // A Flow is created when we observe a "saga.<kind>.started" event. It is
@@ -51,7 +57,7 @@ type Flow struct {
 	Kind           FlowKind   `gorm:"size:64;not null;index" json:"kind"`
 	State          FlowState  `gorm:"size:32;not null;index" json:"state"`
 	TriggerEvent   string     `gorm:"size:128;not null" json:"trigger_event"`
-	OrganizationID string     `gorm:"size:64;index" json:"organization_id,omitempty"`
+	OrganizationID uuid.UUID  `gorm:"type:uuid;index" json:"organization_id"`
 	UserID         string     `gorm:"size:64;index" json:"user_id,omitempty"`
 	CurrentStep    string     `gorm:"size:128" json:"current_step,omitempty"`
 	Services       StringList `gorm:"serializer:json" json:"services"`

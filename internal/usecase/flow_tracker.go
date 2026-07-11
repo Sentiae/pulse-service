@@ -9,11 +9,20 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/sentiae/platform-kit/tenant"
 	"github.com/sentiae/pulse-service/internal/domain"
 	"github.com/sentiae/pulse-service/internal/repository/postgres"
 	"github.com/sentiae/pulse-service/pkg/events"
 	"github.com/sentiae/pulse-service/pkg/logger"
 )
+
+// SagaOrgResolver resolves the owning org of a saga by its saga_id, for a
+// late-arriving saga step event that carries no org in its own payload. The
+// port is defined here (hexagonal) and satisfied by
+// postgres.TenantResolverRepo.
+type SagaOrgResolver interface {
+	ResolveSagaOrg(ctx context.Context, sagaID string) (uuid.UUID, error)
+}
 
 // FlowTracker is the heart of pulse-service: it consumes saga events, uses
 // them to build Flow rows, and broadcasts live updates to any WebSocket
@@ -25,6 +34,7 @@ import (
 type FlowTracker struct {
 	repo      *postgres.FlowRepository
 	publisher events.Publisher
+	resolver  SagaOrgResolver
 
 	// Subscribers for live updates (WebSocket). Populated via Subscribe /
 	// Unsubscribe; broadcast is best-effort and non-blocking.
@@ -34,10 +44,11 @@ type FlowTracker struct {
 }
 
 // NewFlowTracker constructs the tracker.
-func NewFlowTracker(repo *postgres.FlowRepository, publisher events.Publisher) *FlowTracker {
+func NewFlowTracker(repo *postgres.FlowRepository, publisher events.Publisher, resolver SagaOrgResolver) *FlowTracker {
 	return &FlowTracker{
 		repo:        repo,
 		publisher:   publisher,
+		resolver:    resolver,
 		subscribers: make(map[int]chan *domain.Flow),
 	}
 }
@@ -63,6 +74,17 @@ func (t *FlowTracker) OnEvent(ctx context.Context, event events.CloudEvent) erro
 		return nil
 	}
 
+	// Resolve the owning org for RLS: the CloudEvent payload's org, else the org
+	// of the flow already started under this saga_id (a late step event carrying
+	// no org lands in the same org as its start event), else the platform
+	// sentinel. Stamp it on ctx so every write in this event's body targets the
+	// right tenant partition under FORCE-RLS.
+	org, err := resolveEventOrg(ctx, orgID, sagaID, t.resolver)
+	if err != nil {
+		return err
+	}
+	ctx = tenant.WithSystemOrg(ctx, org)
+
 	// Always persist raw event for replay.
 	rawPayload := string(event.Data)
 
@@ -76,7 +98,7 @@ func (t *FlowTracker) OnEvent(ctx context.Context, event events.CloudEvent) erro
 			Kind:           kind,
 			State:          domain.FlowStateRunning,
 			TriggerEvent:   event.Type,
-			OrganizationID: orgID,
+			OrganizationID: org,
 			UserID:         userID,
 			CurrentStep:    domain.StepNameFromEventType(event.Type),
 			Services:       domain.StringList{domain.ServiceForEvent(event.Type)},
@@ -87,7 +109,7 @@ func (t *FlowTracker) OnEvent(ctx context.Context, event events.CloudEvent) erro
 		if err := t.repo.CreateFlow(ctx, flow); err != nil {
 			return fmt.Errorf("create flow: %w", err)
 		}
-		t.recordAudit(ctx, flow.ID, sagaID, event, rawPayload)
+		t.recordAudit(ctx, org, flow.ID, sagaID, event, rawPayload)
 		t.emitFlowCreated(ctx, flow)
 		t.broadcast(flow)
 		return nil
@@ -101,7 +123,7 @@ func (t *FlowTracker) OnEvent(ctx context.Context, event events.CloudEvent) erro
 			Kind:           kind,
 			State:          domain.FlowStateRunning,
 			TriggerEvent:   "synthetic:" + event.Type,
-			OrganizationID: orgID,
+			OrganizationID: org,
 			UserID:         userID,
 			Services:       domain.StringList{domain.ServiceForEvent(event.Type)},
 			StepsTotal:     kind.ExpectedSteps(),
@@ -110,7 +132,7 @@ func (t *FlowTracker) OnEvent(ctx context.Context, event events.CloudEvent) erro
 		if err := t.repo.CreateFlow(ctx, flow); err != nil {
 			return fmt.Errorf("create synthetic flow: %w", err)
 		}
-		t.recordAudit(ctx, flow.ID, sagaID, event, rawPayload)
+		t.recordAudit(ctx, org, flow.ID, sagaID, event, rawPayload)
 
 	case err != nil:
 		return fmt.Errorf("lookup flow: %w", err)
@@ -122,13 +144,14 @@ func (t *FlowTracker) OnEvent(ctx context.Context, event events.CloudEvent) erro
 	terminal, terminalState := domain.IsTerminal(event.Type)
 
 	step := &domain.FlowStep{
-		ID:        uuid.New(),
-		FlowID:    flow.ID,
-		StepName:  stepName,
-		Service:   domain.ServiceForEvent(event.Type),
-		EventType: event.Type,
-		Status:    domain.FlowStepStatusCompleted,
-		StartedAt: now,
+		ID:             uuid.New(),
+		FlowID:         flow.ID,
+		OrganizationID: org,
+		StepName:       stepName,
+		Service:        domain.ServiceForEvent(event.Type),
+		EventType:      event.Type,
+		Status:         domain.FlowStepStatusCompleted,
+		StartedAt:      now,
 		CompletedAt: func() *time.Time {
 			n := now
 			return &n
@@ -161,7 +184,7 @@ func (t *FlowTracker) OnEvent(ctx context.Context, event events.CloudEvent) erro
 	if err := t.repo.UpdateFlow(ctx, flow); err != nil {
 		return fmt.Errorf("update flow: %w", err)
 	}
-	t.recordAudit(ctx, flow.ID, sagaID, event, rawPayload)
+	t.recordAudit(ctx, org, flow.ID, sagaID, event, rawPayload)
 
 	if terminal {
 		if terminalState == domain.FlowStateCompleted {
@@ -237,14 +260,15 @@ func (t *FlowTracker) emitFlowCreated(ctx context.Context, flow *domain.Flow) {
 	t.emit(ctx, events.EventFlowCreated, flow)
 }
 
-func (t *FlowTracker) recordAudit(ctx context.Context, flowID uuid.UUID, sagaID string, ev events.CloudEvent, payload string) {
+func (t *FlowTracker) recordAudit(ctx context.Context, org uuid.UUID, flowID uuid.UUID, sagaID string, ev events.CloudEvent, payload string) {
 	entry := &domain.EventAudit{
-		FlowID:     flowID,
-		SagaID:     sagaID,
-		EventType:  ev.Type,
-		Source:     ev.Source,
-		OccurredAt: parseEventTime(ev.Time),
-		Payload:    payload,
+		FlowID:         flowID,
+		OrganizationID: org,
+		SagaID:         sagaID,
+		EventType:      ev.Type,
+		Source:         ev.Source,
+		OccurredAt:     parseEventTime(ev.Time),
+		Payload:        payload,
 	}
 	if err := t.repo.AppendEventAudit(ctx, entry); err != nil {
 		logger.Warn("append audit failed: %v", err)
@@ -282,6 +306,40 @@ func stringField(m map[string]any, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+// resolveEventOrg computes the owning org for an incoming saga event in three
+// steps: (1) the org carried in the CloudEvent payload; (2) failing that, the org
+// of the flow already started under the same saga_id (so a late step event with
+// no org lands in the same org as its start event); (3) failing that, the
+// platform sentinel org. Returns an error only if the saga resolver itself fails.
+func resolveEventOrg(ctx context.Context, payloadOrg, sagaID string, resolver SagaOrgResolver) (uuid.UUID, error) {
+	org := parseOrgID(payloadOrg)
+	if org == uuid.Nil {
+		resolved, err := resolver.ResolveSagaOrg(ctx, sagaID)
+		if err != nil {
+			return uuid.Nil, fmt.Errorf("resolve saga org: %w", err)
+		}
+		org = resolved
+	}
+	if org == uuid.Nil {
+		org = domain.PlatformSentinelOrg
+	}
+	return org, nil
+}
+
+// parseOrgID parses a CloudEvent organization_id string into a uuid, returning
+// uuid.Nil for an empty or malformed value (the "no org in payload" signal that
+// triggers saga/sentinel resolution).
+func parseOrgID(s string) uuid.UUID {
+	if s == "" {
+		return uuid.Nil
+	}
+	id, err := uuid.Parse(s)
+	if err != nil {
+		return uuid.Nil
+	}
+	return id
 }
 
 func parseEventTime(ts string) time.Time {

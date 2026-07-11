@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/sentiae/platform-kit/tenant"
 	"github.com/sentiae/pulse-service/internal/domain"
 	"github.com/sentiae/pulse-service/internal/repository/postgres"
 	"github.com/sentiae/pulse-service/pkg/events"
@@ -52,6 +53,16 @@ func (a *AuditRecorder) OnEvent(ctx context.Context, event events.CloudEvent) er
 		domainName = event.Type[:dot]
 	}
 
+	// Resolve the owning org for RLS: the CloudEvent payload's org, else the
+	// platform sentinel for org-less platform events. Stamp it on ctx (never
+	// WithSystemContext — that skips the GUC stamp and a FORCE-RLS write then
+	// sees zero rows / is denied) so the audit insert targets the right tenant.
+	org := parseOrgID(meta.OrganizationID)
+	if org == uuid.Nil {
+		org = domain.PlatformSentinelOrg
+	}
+	ctx = tenant.WithSystemOrg(ctx, org)
+
 	row := &domain.EventAudit{
 		ID:             uuid.New(),
 		EventType:      event.Type,
@@ -60,7 +71,7 @@ func (a *AuditRecorder) OnEvent(ctx context.Context, event events.CloudEvent) er
 		SourceService:  event.Source,
 		ResourceType:   meta.ResourceType,
 		ResourceID:     meta.ResourceID,
-		OrganizationID: meta.OrganizationID,
+		OrganizationID: org,
 		ActorID:        meta.ActorID,
 		OccurredAt:     parseEventTime(event.Time),
 		Payload:        string(event.Data),
