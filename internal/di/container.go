@@ -55,6 +55,12 @@ type Container struct {
 	AlertActivityConsumer  *messaging.AlertActivityConsumer
 	DeployActivityConsumer *messaging.DeployActivityConsumer
 
+	// wiringErrs records consumers that failed to construct at boot. Pulse keeps
+	// serving the REST API (a wiring failure must not crash-loop the service) but
+	// reports NOT ready, so the failure cannot pass as healthy. Written once
+	// during initConsumers, read-only afterwards.
+	wiringErrs []string
+
 	HTTPServer *httphandler.Server
 	Publisher  events.Publisher
 
@@ -280,9 +286,10 @@ func (c *Container) initConsumers() error {
 		c.FlowTracker,
 	)
 	if err != nil {
-		// Don't fail the service on consumer wiring error — Pulse still
-		// serves the REST API for historical flow lookups.
-		logger.Error("flow consumer not started: %v", err)
+		// Don't fail the service on consumer wiring error — Pulse still serves
+		// the REST API for historical flow lookups — but record it so /ready
+		// reports NOT ready. Logging alone let this go unnoticed for months.
+		c.recordWiringErr("flow", err)
 	} else {
 		c.FlowConsumer = cons
 	}
@@ -296,7 +303,7 @@ func (c *Container) initConsumers() error {
 		c.AuditRecorder,
 	)
 	if err != nil {
-		logger.Error("audit consumer not started: %v", err)
+		c.recordWiringErr("audit", err)
 	} else {
 		c.AuditConsumer = audit
 	}
@@ -310,7 +317,7 @@ func (c *Container) initConsumers() error {
 		c.AlertTracker,
 	)
 	if err != nil {
-		logger.Error("alert activity consumer not started: %v", err)
+		c.recordWiringErr("alert-activity", err)
 	} else {
 		c.AlertActivityConsumer = alertCons
 	}
@@ -322,11 +329,19 @@ func (c *Container) initConsumers() error {
 		c.DeployTracker,
 	)
 	if err != nil {
-		logger.Error("deploy activity consumer not started: %v", err)
+		c.recordWiringErr("deploy-activity", err)
 	} else {
 		c.DeployActivityConsumer = deployCons
 	}
 	return nil
+}
+
+// recordWiringErr logs a consumer wiring failure and records it so /ready
+// reports NOT ready. Boot continues: an unreachable broker must surface as
+// not-ready, never as a crash-loop.
+func (c *Container) recordWiringErr(name string, err error) {
+	logger.Error("%s consumer not started: %v", name, err)
+	c.wiringErrs = append(c.wiringErrs, fmt.Sprintf("%s consumer not wired: %v", name, err))
 }
 
 func (c *Container) initHandlers() {
@@ -336,6 +351,7 @@ func (c *Container) initHandlers() {
 		c.TenantResolver,
 		c.FlowTracker,
 		c.AuditRecorder,
+		c.Readiness,
 	)
 	c.HTTPServer.SetActivityTrackers(c.AlertTracker, c.DeployTracker)
 	// §3 Pulse aggregator — gRPC fan-out to ops + work services.

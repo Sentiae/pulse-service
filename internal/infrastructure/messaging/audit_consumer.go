@@ -63,3 +63,9 @@ func NewAuditConsumer(brokers []string, groupID string, recorder *usecase.AuditR
 func (c *AuditConsumer) Start(ctx context.Context) error {
 	return c.consumer.Start(ctx)
 }
+
+// AssignmentError reports the fatal zero-partition-assignment error. See
+// FlowConsumer.AssignmentError.
+func (c *AuditConsumer) AssignmentError() error {
+	return c.consumer.AssignmentError()
+}

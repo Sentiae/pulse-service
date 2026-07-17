@@ -153,3 +153,11 @@ func NewFlowConsumer(brokers []string, groupID string, tracker *usecase.FlowTrac
 func (c *FlowConsumer) Start(ctx context.Context) error {
 	return c.consumer.Start(ctx)
 }
+
+// AssignmentError reports the fatal "group stable with ZERO partitions" error
+// recorded once the assignment deadline passes — the state in which messages
+// will never be fetched (unreachable broker, missing partitions). Nil while the
+// group is healthy or the assertion has not yet concluded.
+func (c *FlowConsumer) AssignmentError() error {
+	return c.consumer.AssignmentError()
+}

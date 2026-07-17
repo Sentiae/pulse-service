@@ -82,6 +82,12 @@ func (c *AlertActivityConsumer) Start(ctx context.Context) error {
 	return c.consumer.Start(ctx)
 }
 
+// AssignmentError reports the fatal zero-partition-assignment error. See
+// FlowConsumer.AssignmentError.
+func (c *AlertActivityConsumer) AssignmentError() error {
+	return c.consumer.AssignmentError()
+}
+
 // NewDeployActivityConsumer wires the tracker to deploy lifecycle topics.
 func NewDeployActivityConsumer(brokers []string, groupID string, tracker *usecase.DeployTracker) (*DeployActivityConsumer, error) {
 	topics := topicsForEventTypes(deployEventTypes)
@@ -108,6 +114,12 @@ func NewDeployActivityConsumer(brokers []string, groupID string, tracker *usecas
 // Start blocks until ctx is done.
 func (c *DeployActivityConsumer) Start(ctx context.Context) error {
 	return c.consumer.Start(ctx)
+}
+
+// AssignmentError reports the fatal zero-partition-assignment error. See
+// FlowConsumer.AssignmentError.
+func (c *DeployActivityConsumer) AssignmentError() error {
+	return c.consumer.AssignmentError()
 }
 
 // topicsForEventTypes derives the deduped Kafka topic list for a bare

@@ -20,6 +20,22 @@ import (
 	"github.com/sentiae/pulse-service/pkg/logger"
 )
 
+// Readiness is the service's readiness verdict.
+type Readiness struct {
+	// Reasons why pulse cannot do its job. Non-empty = NOT ready.
+	Reasons []string
+
+	// Degraded lists limitations that are legal because an operator declared
+	// them via a named, explicit flag. They do NOT make pulse unready, but they
+	// are reported so the state is readable rather than inferred from silence
+	// (D-162a: the only legal fail-open is a named, explicit, enumerable flag —
+	// "enumerable" is why this field exists).
+	Degraded []string
+}
+
+// ReadinessFunc reports the service's readiness verdict.
+type ReadinessFunc func() Readiness
+
 // Server wires the REST + WebSocket surface of pulse-service.
 type Server struct {
 	router        chi.Router
@@ -31,6 +47,7 @@ type Server struct {
 	aggregator    *usecase.Aggregator
 	alertTracker  *usecase.AlertTracker
 	deployTracker *usecase.DeployTracker
+	readiness     ReadinessFunc
 	wsUp          websocket.Upgrader
 }
 
@@ -40,6 +57,7 @@ func NewServer(
 	orgResolver OrgResolver,
 	tracker *usecase.FlowTracker,
 	recorder *usecase.AuditRecorder,
+	readiness ReadinessFunc,
 ) *Server {
 	s := &Server{
 		jwks:          jwks,
@@ -47,6 +65,7 @@ func NewServer(
 		orgResolver:   orgResolver,
 		tracker:       tracker,
 		recorder:      recorder,
+		readiness:     readiness,
 		wsUp: websocket.Upgrader{
 			// Pulse is behind the BFF in production; accept all origins in
 			// dev and let the BFF enforce origin checks.
@@ -84,8 +103,36 @@ func (s *Server) setupRoutes() {
 	r.Get("/health", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "healthy", "service": "pulse"})
 	})
+	// /ready is the compose healthcheck's probe: it must be able to fail.
+	// /health above stays a liveness signal (the process is up) — an
+	// unreachable broker must not restart the container, only mark it
+	// not-ready.
 	r.Get("/ready", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
+		// No readiness probe wired = we cannot prove readiness = not ready.
+		// A control that can't prove itself must not report success.
+		if s.readiness == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+				"status":  "not_ready",
+				"reasons": []string{"readiness probe not wired"},
+			})
+			return
+		}
+		rd := s.readiness()
+		body := map[string]any{"status": "ready"}
+		// A declared limitation stays 200 (it is a legal, operator-chosen
+		// state) but must be readable in the body: a pulse that is
+		// intentionally blind and a pulse that is actually observing events
+		// must never look identical.
+		if len(rd.Degraded) > 0 {
+			body["degraded"] = rd.Degraded
+		}
+		if len(rd.Reasons) > 0 {
+			body["status"] = "not_ready"
+			body["reasons"] = rd.Reasons
+			writeJSON(w, http.StatusServiceUnavailable, body)
+			return
+		}
+		writeJSON(w, http.StatusOK, body)
 	})
 
 	// Authenticated surface. authMiddleware runs first so every route below
