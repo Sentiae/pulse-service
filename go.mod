@@ -7,7 +7,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/sentiae/ops-service v0.1.0
-	github.com/sentiae/platform-kit v0.1.0
+	github.com/sentiae/platform-kit v0.2.0
 	github.com/sentiae/work-service v0.4.0
 	github.com/spiffe/go-spiffe/v2 v2.6.0
 	google.golang.org/grpc v1.81.1
@@ -78,8 +78,6 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 )
-
-replace github.com/sentiae/platform-kit => ../platform-kit
 
 replace github.com/sentiae/ops-service => ../ops-service
 
