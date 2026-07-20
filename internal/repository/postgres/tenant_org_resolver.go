@@ -12,7 +12,7 @@ import (
 )
 
 // TenantResolverRepo resolves owning orgs via the D-072 SECURITY DEFINER rls_*
-// functions (rls_objects.go). Each lookup runs under tenant.WithSystemContext so
+// functions (migrations/0001_baseline.up.sql). Each lookup runs under tenant.WithSystemContext so
 // the Enforce plugin skips stamping this bootstrap query — the function itself
 // resolves the org with definer privileges while the app pool stays NOBYPASSRLS.
 type TenantResolverRepo struct {

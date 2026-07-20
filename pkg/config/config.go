@@ -225,14 +225,6 @@ func (c *Config) GetKafkaBrokers() []string {
 	return strings.Split(c.Messaging.Kafka.Brokers, ",")
 }
 
-// RLSStampEnabled gates the P4 RLS object apply (ApplyRLSObjects) at boot. Read
-// from APP_RLS_STAMP_ENABLED; unset or any non-"true" value returns false, so RLS
-// stays a no-op until it is explicitly switched on for the flip (D-070). Mirrors
-// work-service config.RLSStampEnabled().
-func RLSStampEnabled() bool {
-	return strings.EqualFold(strings.TrimSpace(os.Getenv("APP_RLS_STAMP_ENABLED")), "true")
-}
-
 // RLSEnforceEnabled gates the read-path RLS enforcement (the tenantdb.Enforce GORM
 // plugin + boot posture assertion), wired in a later task. Read from
 // APP_RLS_ENFORCE_ENABLED; unset or any non-"true" value returns false. Kept OFF

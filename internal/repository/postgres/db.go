@@ -6,8 +6,6 @@ import (
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
-
-	"github.com/sentiae/pulse-service/internal/domain"
 )
 
 // Config contains the DB connection parameters.
@@ -32,13 +30,4 @@ func NewDB(cfg Config) (*gorm.DB, error) {
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
 	return db, nil
-}
-
-// AutoMigrate creates / updates the pulse schema.
-func AutoMigrate(db *gorm.DB) error {
-	return db.AutoMigrate(
-		&domain.Flow{},
-		&domain.FlowStep{},
-		&domain.EventAudit{},
-	)
 }
