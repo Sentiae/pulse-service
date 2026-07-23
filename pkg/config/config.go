@@ -18,6 +18,17 @@ type Config struct {
 	Messaging MessagingConfig `mapstructure:"messaging"`
 	Features  FeaturesConfig  `mapstructure:"features"`
 	Security  SecurityConfig  `mapstructure:"security"`
+	Telemetry TelemetryConfig `mapstructure:"telemetry"`
+}
+
+// TelemetryConfig configures the OTLP export (traces + the promauto→OTLP
+// prometheus bridge) wired via platform-kit otel.Init. OTLPEndpoint is
+// intentionally NOT validate:"required" — a missing env defaults to the
+// in-cluster collector and never breaks boot; an empty endpoint makes
+// otel.Init a no-op.
+type TelemetryConfig struct {
+	ServiceName  string `mapstructure:"service_name"`
+	OTLPEndpoint string `mapstructure:"otlp_endpoint"`
 }
 
 type AppConfig struct {
@@ -175,6 +186,9 @@ func Load() (*Config, error) {
 			// Security - gRPC auth interceptor (service token + JWKS user token)
 			"security.auth.jwks_url":   "http://identity-service:8080/.well-known/jwks.json",
 			"security.auth.jwt_issuer": "identity-service",
+
+			"telemetry.service_name":  "pulse-service",
+			"telemetry.otlp_endpoint": "otel-collector:4317",
 		},
 		BindEnvs: [][2]string{
 			{"app.name", "APP_APP_NAME"},
@@ -206,6 +220,8 @@ func Load() (*Config, error) {
 			{"security.auth.jwt_issuer", "APP_AUTH_JWT_ISSUER"},
 
 			{"features.event_publishing", "APP_FEATURES_EVENT_PUBLISHING"},
+
+			{"telemetry.otlp_endpoint", "APP_TELEMETRY_OTLP_ENDPOINT"},
 		},
 	})
 	if err != nil {

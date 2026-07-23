@@ -11,6 +11,7 @@ import (
 	"time"
 
 	pkkafka "github.com/sentiae/platform-kit/kafka"
+	otelkit "github.com/sentiae/platform-kit/otel"
 	"github.com/sentiae/pulse-service/internal/di"
 	"github.com/sentiae/pulse-service/pkg/config"
 	"github.com/sentiae/pulse-service/pkg/logger"
@@ -52,6 +53,25 @@ func main() {
 		logger.Fatal("Failed to load configuration: %v", err)
 	}
 	logger.Info("Configuration loaded: env=%s, http_port=%s", cfg.App.Environment, cfg.Server.HTTP.Port)
+
+	// Telemetry: wire OTLP export (traces + the promauto→OTLP prometheus bridge)
+	// early, before servers/consumers start. Non-fatal — an export failure must
+	// never break boot; log-and-continue.
+	shutdownTelemetry, err := otelkit.Init(context.Background(), otelkit.Config{
+		ServiceName:    cfg.Telemetry.ServiceName,
+		ServiceVersion: cfg.App.Version,
+		Environment:    cfg.App.Environment,
+		Endpoint:       cfg.Telemetry.OTLPEndpoint,
+		Insecure:       true,
+	})
+	if err != nil {
+		logger.Error("Telemetry init failed (continuing without OTLP export): %v", err)
+	}
+	defer func() {
+		if shutdownTelemetry != nil {
+			_ = shutdownTelemetry(context.Background())
+		}
+	}()
 
 	container, err := di.NewContainer(cfg)
 	if err != nil {
