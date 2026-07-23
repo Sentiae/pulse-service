@@ -13,7 +13,6 @@ import (
 	kafka "github.com/sentiae/platform-kit/kafka"
 	pkgmiddleware "github.com/sentiae/platform-kit/middleware"
 	"github.com/sentiae/platform-kit/posture"
-	"github.com/sentiae/platform-kit/spiffe"
 	"github.com/sentiae/platform-kit/tenant"
 	"github.com/sentiae/platform-kit/tenantdb"
 	"github.com/spiffe/go-spiffe/v2/workloadapi"
@@ -73,8 +72,10 @@ type Container struct {
 	Publisher  events.Publisher
 
 	// mtlsSource is the shared SPIFFE X509 source for pulse's outbound gRPC
-	// dials (Phase 2 mTLS mesh). Nil when APP_GRPC_MTLS_MODE is off or the
-	// workload API is unavailable — grpcclient.Dial then falls back to insecure.
+	// dials (Phase 2 mTLS mesh). Nil when APP_GRPC_MTLS_MODE is off, or under
+	// permissive when the workload API is down (dials then degrade to insecure
+	// with a loud warn via grpcclient.Dial). Under strict a source failure is a
+	// boot error, so this is never nil while serving under strict.
 	mtlsSource *workloadapi.X509Source
 }
 
@@ -94,24 +95,26 @@ func NewContainer(cfg *config.Config) (*Container, error) {
 	if err := c.initConsumers(); err != nil {
 		return nil, fmt.Errorf("init consumers: %w", err)
 	}
-	c.initMTLSSource()
+	if err := c.initMTLSSource(); err != nil {
+		return nil, err
+	}
 	c.initHandlers()
 	return c, nil
 }
 
 // initMTLSSource builds the one shared SPIFFE X509 source for pulse's outbound
-// gRPC dials when APP_GRPC_MTLS_MODE is not off. On workload-API failure it
-// degrades to nil so grpcclient.Dial falls back to insecure.
-func (c *Container) initMTLSSource() {
-	if pkconfig.MTLSMode() == pkconfig.MTLSModeOff {
-		return
-	}
-	src, err := spiffe.NewSource(context.Background())
+// gRPC dials via the fail-closed platform-kit helper (v0.3.4). Posture is applied
+// centrally in grpcclient.NewMeshSource: off ⇒ nil source; strict + unreachable
+// workload API ⇒ error (pulse REFUSES to boot rather than come up with a nil
+// source that silently plaintext-dials — the #pulse-outbound-mtls-fail-open fix);
+// permissive + SPIRE down ⇒ nil source + loud warn (dials degrade via Dial).
+func (c *Container) initMTLSSource() error {
+	src, err := grpcclient.NewMeshSource(context.Background(), pkconfig.MTLSMode())
 	if err != nil {
-		logger.Error("SPIFFE client source unavailable, gRPC clients degrade to insecure: %v", err)
-		return
+		return fmt.Errorf("init mtls mesh source (strict mesh dialing): %w", err)
 	}
 	c.mtlsSource = src
+	return nil
 }
 
 func (c *Container) initDatabase() error {
