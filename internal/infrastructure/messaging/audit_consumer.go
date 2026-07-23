@@ -64,6 +64,12 @@ func (c *AuditConsumer) Start(ctx context.Context) error {
 	return c.consumer.Start(ctx)
 }
 
+// KafkaConsumer exposes the underlying platform-kit consumer so the ops
+// /healthz/consumers surface can read its per-topic lag + DLQ counters.
+func (c *AuditConsumer) KafkaConsumer() *kafka.KafkaConsumer {
+	return c.consumer
+}
+
 // AssignmentError reports the fatal zero-partition-assignment error. See
 // FlowConsumer.AssignmentError.
 func (c *AuditConsumer) AssignmentError() error {

@@ -154,6 +154,12 @@ func (c *FlowConsumer) Start(ctx context.Context) error {
 	return c.consumer.Start(ctx)
 }
 
+// KafkaConsumer exposes the underlying platform-kit consumer so the ops
+// /healthz/consumers surface can read its per-topic lag + DLQ counters.
+func (c *FlowConsumer) KafkaConsumer() *kafka.KafkaConsumer {
+	return c.consumer
+}
+
 // AssignmentError reports the fatal "group stable with ZERO partitions" error
 // recorded once the assignment deadline passes — the state in which messages
 // will never be fetched (unreachable broker, missing partitions). Nil while the

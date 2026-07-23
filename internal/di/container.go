@@ -10,7 +10,9 @@ import (
 
 	pkconfig "github.com/sentiae/platform-kit/config"
 	"github.com/sentiae/platform-kit/grpcclient"
+	kafka "github.com/sentiae/platform-kit/kafka"
 	pkgmiddleware "github.com/sentiae/platform-kit/middleware"
+	"github.com/sentiae/platform-kit/posture"
 	"github.com/sentiae/platform-kit/spiffe"
 	"github.com/sentiae/platform-kit/tenant"
 	"github.com/sentiae/platform-kit/tenantdb"
@@ -49,6 +51,12 @@ type Container struct {
 	// JWKSValidator validates BFF-forwarded user Bearer tokens for the HTTP auth
 	// middleware (D-073). Nil when RLS enforcement is off and JWKS is unavailable.
 	JWKSValidator pkgmiddleware.TokenValidator
+
+	// Posture is pulse's declared security posture (D-162a). It carries the one
+	// real fail-closed control — RLS enforcement proven at boot — and backs the
+	// /posture ops endpoint. Nil when RLS enforcement is off (no control to
+	// declare), which /posture reports as "not declared".
+	Posture *posture.Set
 
 	FlowConsumer           *messaging.FlowConsumer
 	AuditConsumer          *messaging.AuditConsumer
@@ -191,7 +199,22 @@ func (c *Container) initDatabase() error {
 			return fmt.Errorf("register RLS enforce plugin: %w", err)
 		}
 		logger.Info("RLS Enforce plugin registered on app pool (read-path enforcement ON)")
-		if err := tenantdb.AssertPosture(db, tenantdb.PostureEnforced); err != nil {
+		// D-162a: declare the RLS enforcement as pulse's one named security
+		// control and prove it at boot. Same assertion, same fail-closed
+		// behavior as the prior bare AssertPosture call — now enumerable via
+		// the /posture ops surface. An empty/invalid declaration is itself a
+		// boot error (the disease inside the cure).
+		set, err := posture.Declare(posture.Control{
+			Name: "rls-enforced",
+			Assert: func(ctx context.Context) error {
+				return tenantdb.AssertPosture(db, tenantdb.PostureEnforced)
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("declare RLS boot posture: %w", err)
+		}
+		c.Posture = set
+		if err := set.MustHold(context.Background()); err != nil {
 			return fmt.Errorf("RLS boot posture assertion failed: %w", err)
 		}
 		logger.Info("RLS boot posture verified (app role is RLS-enforced)")
@@ -324,6 +347,26 @@ func (c *Container) initConsumers() error {
 	return nil
 }
 
+// kafkaConsumers returns the underlying platform-kit consumers for the wired
+// consumer wrappers, skipping any that failed to construct. Backs the
+// /healthz/consumers ops surface (Wave-8).
+func (c *Container) kafkaConsumers() []*kafka.KafkaConsumer {
+	var out []*kafka.KafkaConsumer
+	if c.FlowConsumer != nil {
+		out = append(out, c.FlowConsumer.KafkaConsumer())
+	}
+	if c.AuditConsumer != nil {
+		out = append(out, c.AuditConsumer.KafkaConsumer())
+	}
+	if c.AlertActivityConsumer != nil {
+		out = append(out, c.AlertActivityConsumer.KafkaConsumer())
+	}
+	if c.DeployActivityConsumer != nil {
+		out = append(out, c.DeployActivityConsumer.KafkaConsumer())
+	}
+	return out
+}
+
 // recordWiringErr logs a consumer wiring failure and records it so /ready
 // reports NOT ready. Boot continues: an unreachable broker must surface as
 // not-ready, never as a crash-loop.
@@ -333,6 +376,9 @@ func (c *Container) recordWiringErr(name string, err error) {
 }
 
 func (c *Container) initHandlers() {
+	// Consumers are constructed in initConsumers (called before initHandlers),
+	// so the /healthz/consumers surface reads the live wrappers here. Nil
+	// wrappers (failed to construct) are skipped by kafkaConsumers.
 	c.HTTPServer = httphandler.NewServer(
 		c.JWKSValidator,
 		c.Config.Security.Auth.ServiceAPIKey,
@@ -340,6 +386,8 @@ func (c *Container) initHandlers() {
 		c.FlowTracker,
 		c.AuditRecorder,
 		c.Readiness,
+		c.Posture,
+		c.kafkaConsumers()...,
 	)
 	c.HTTPServer.SetActivityTrackers(c.AlertTracker, c.DeployTracker)
 	// §3 Pulse aggregator — gRPC fan-out to ops + work services.

@@ -77,7 +77,7 @@ func TestReadyEndpoint(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// /ready is unauthenticated and touches none of the other
 			// collaborators, so nil is safe for them here.
-			s := NewServer(nil, "", nil, nil, nil, tt.readiness)
+			s := NewServer(nil, "", nil, nil, nil, tt.readiness, nil)
 
 			rec := httptest.NewRecorder()
 			s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/ready", nil))
@@ -106,7 +106,7 @@ func TestReadyEndpoint(t *testing.T) {
 func TestHealthEndpointStaysLiveness(t *testing.T) {
 	s := NewServer(nil, "", nil, nil, nil, func() Readiness {
 		return Readiness{Reasons: []string{"flow consumer cannot fetch: zero partitions assigned"}}
-	})
+	}, nil)
 
 	rec := httptest.NewRecorder()
 	s.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))

@@ -12,7 +12,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 
+	kafka "github.com/sentiae/platform-kit/kafka"
 	pkgmiddleware "github.com/sentiae/platform-kit/middleware"
+	"github.com/sentiae/platform-kit/opshttp"
+	"github.com/sentiae/platform-kit/posture"
 
 	"github.com/sentiae/pulse-service/internal/domain"
 	"github.com/sentiae/pulse-service/internal/repository/postgres"
@@ -48,6 +51,8 @@ type Server struct {
 	alertTracker  *usecase.AlertTracker
 	deployTracker *usecase.DeployTracker
 	readiness     ReadinessFunc
+	postureSet    *posture.Set
+	consumers     []*kafka.KafkaConsumer
 	wsUp          websocket.Upgrader
 }
 
@@ -58,6 +63,8 @@ func NewServer(
 	tracker *usecase.FlowTracker,
 	recorder *usecase.AuditRecorder,
 	readiness ReadinessFunc,
+	postureSet *posture.Set,
+	consumers ...*kafka.KafkaConsumer,
 ) *Server {
 	s := &Server{
 		jwks:          jwks,
@@ -66,6 +73,8 @@ func NewServer(
 		tracker:       tracker,
 		recorder:      recorder,
 		readiness:     readiness,
+		postureSet:    postureSet,
+		consumers:     consumers,
 		wsUp: websocket.Upgrader{
 			// Pulse is behind the BFF in production; accept all origins in
 			// dev and let the BFF enforce origin checks.
@@ -134,6 +143,14 @@ func (s *Server) setupRoutes() {
 		}
 		writeJSON(w, http.StatusOK, body)
 	})
+
+	// Wave-8 uniform ops surface. /posture reports the declared security
+	// controls + their boot result; /healthz/consumers surfaces per-topic Kafka
+	// lag + DLQ activity. /health + /ready above are pulse's own (superior)
+	// liveness/readiness and stay untouched — these two add the fleet-uniform
+	// ops endpoints alongside them.
+	r.Handle("/posture", opshttp.PostureHandler("pulse", s.postureSet))
+	r.Handle("/healthz/consumers", kafka.ConsumersHealthzHandler("pulse", s.consumers...))
 
 	// Authenticated surface. authMiddleware runs first so every route below
 	// requires a valid Bearer JWT (→ user principal) or x-api-key (→ service

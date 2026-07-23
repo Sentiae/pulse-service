@@ -82,6 +82,12 @@ func (c *AlertActivityConsumer) Start(ctx context.Context) error {
 	return c.consumer.Start(ctx)
 }
 
+// KafkaConsumer exposes the underlying platform-kit consumer so the ops
+// /healthz/consumers surface can read its per-topic lag + DLQ counters.
+func (c *AlertActivityConsumer) KafkaConsumer() *kafka.KafkaConsumer {
+	return c.consumer
+}
+
 // AssignmentError reports the fatal zero-partition-assignment error. See
 // FlowConsumer.AssignmentError.
 func (c *AlertActivityConsumer) AssignmentError() error {
@@ -114,6 +120,12 @@ func NewDeployActivityConsumer(brokers []string, groupID string, tracker *usecas
 // Start blocks until ctx is done.
 func (c *DeployActivityConsumer) Start(ctx context.Context) error {
 	return c.consumer.Start(ctx)
+}
+
+// KafkaConsumer exposes the underlying platform-kit consumer so the ops
+// /healthz/consumers surface can read its per-topic lag + DLQ counters.
+func (c *DeployActivityConsumer) KafkaConsumer() *kafka.KafkaConsumer {
+	return c.consumer
 }
 
 // AssignmentError reports the fatal zero-partition-assignment error. See
