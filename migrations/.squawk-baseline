@@ -1,0 +1,12 @@
+# squawk lint baseline — pulse-service
+#
+# The migrations listed here are FROZEN: CLAUDE.md §24 forbids editing a
+# past migration, so a squawk finding in one of them cannot be fixed.
+# Linting them retroactively therefore buys nothing and would block every
+# deploy forever. Only migrations added AFTER this baseline are linted by
+# infrastructure/scripts/migration-gate.sh (run on every deploy).
+#
+# Do NOT add a new migration to this file to silence the gate. Fix the SQL.
+# Regenerate only when intentionally re-baselining:
+#   infrastructure/scripts/migration-gate.sh --baseline pulse-service
+0001_baseline.up.sql
