@@ -76,53 +76,26 @@ var sagaEventTypes = []string{
 	"saga.spec_shipping.completed",
 }
 
-// topicsForEvents maps saga event types to their full Kafka topics, deduped.
-// We look each one up in the platform-kit event taxonomy so the topic
-// derivation lives in one place (the taxonomy owns topicFromEventType).
-func topicsForEvents() []string {
-	set := map[string]struct{}{}
-	for _, t := range sagaEventTypes {
-		if reg, ok := kafka.LookupEvent(t); ok {
-			set[reg.FullTopic("sentiae")] = struct{}{}
-			continue
-		}
-		// Fallback for events not yet registered: compute using the
-		// documented convention "sentiae.{domain}.{resource}".
-		set[fallbackTopic(t)] = struct{}{}
-	}
-	out := make([]string, 0, len(set))
-	for t := range set {
-		out = append(out, t)
-	}
-	return out
-}
-
-// fallbackTopic mirrors platform-kit's internal topicFromEventType
-// derivation. Kept as a best-effort fallback for events that haven't been
-// registered in the taxonomy yet.
-func fallbackTopic(eventType string) string {
-	// "a.b.c.d" → "sentiae.a.b"
-	first, second := -1, -1
-	for i, r := range eventType {
-		if r == '.' {
-			if first == -1 {
-				first = i
-			} else if second == -1 {
-				second = i
-				break
-			}
-		}
-	}
-	if second > 0 {
-		return "sentiae." + eventType[:second]
-	}
-	return "sentiae." + eventType
+// topicsForEvents maps saga event types to their full Kafka topics, deduped,
+// and reports the types the taxonomy does not know. Every topic comes from
+// the taxonomy (RegisteredEvent.FullTopic) — the same derivation the
+// publisher uses — because a second copy of that derivation is how the
+// doubled-topic bug survived: a consumer that restates the rule drifts from
+// the publisher silently and simply starves.
+//
+// There is deliberately no local fallback for unregistered types. An
+// unregistered type cannot reach the wire at all: platform-kit's publisher
+// rejects it in ValidateEventPayload, so any topic guessed for it would be
+// a subscription to a topic nobody can write.
+func topicsForEvents() (topics []string, unregistered []string) {
+	return topicsForEventTypes(sagaEventTypes)
 }
 
 // NewFlowConsumer creates the consumer and registers handlers for every
 // saga event type.
 func NewFlowConsumer(brokers []string, groupID string, tracker *usecase.FlowTracker) (*FlowConsumer, error) {
-	topics := topicsForEvents()
+	topics, unregistered := topicsForEvents()
+	logUnregistered("flow", unregistered)
 
 	cons, err := kafka.NewConsumer(kafka.ConsumerConfig{
 		Brokers: brokers,

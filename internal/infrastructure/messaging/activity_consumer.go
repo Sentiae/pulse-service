@@ -3,6 +3,7 @@ package messaging
 import (
 	"context"
 	"log/slog"
+	"sort"
 
 	kafka "github.com/sentiae/platform-kit/kafka"
 
@@ -56,7 +57,8 @@ type DeployActivityConsumer struct {
 
 // NewAlertActivityConsumer wires the tracker to the alert topics.
 func NewAlertActivityConsumer(brokers []string, groupID string, tracker *usecase.AlertTracker) (*AlertActivityConsumer, error) {
-	topics := topicsForEventTypes(alertEventTypes)
+	topics, unregistered := topicsForEventTypes(alertEventTypes)
+	logUnregistered("alert activity", unregistered)
 	cons, err := kafka.NewConsumer(kafka.ConsumerConfig{
 		Brokers:                 brokers,
 		GroupID:                 groupID,
@@ -96,7 +98,8 @@ func (c *AlertActivityConsumer) AssignmentError() error {
 
 // NewDeployActivityConsumer wires the tracker to deploy lifecycle topics.
 func NewDeployActivityConsumer(brokers []string, groupID string, tracker *usecase.DeployTracker) (*DeployActivityConsumer, error) {
-	topics := topicsForEventTypes(deployEventTypes)
+	topics, unregistered := topicsForEventTypes(deployEventTypes)
+	logUnregistered("deploy activity", unregistered)
 	cons, err := kafka.NewConsumer(kafka.ConsumerConfig{
 		Brokers:                 brokers,
 		GroupID:                 groupID,
@@ -135,21 +138,37 @@ func (c *DeployActivityConsumer) AssignmentError() error {
 }
 
 // topicsForEventTypes derives the deduped Kafka topic list for a bare
-// event-type list. Mirrors the helper in flow_consumer.go so both
-// consumers share the same fallback semantics when the event hasn't
-// been registered in the taxonomy yet.
-func topicsForEventTypes(types []string) []string {
+// event-type list, and reports the types the taxonomy does not know. This is
+// the ONE topic derivation in pulse-service: every subscription resolves its
+// topic through the taxonomy's RegisteredEvent.FullTopic, which is exactly
+// what the publisher uses, so consumer and publisher cannot disagree.
+//
+// Unregistered types yield no topic on purpose — platform-kit's publisher
+// rejects an unregistered event, so nothing can ever be written to a topic
+// invented for one.
+func topicsForEventTypes(types []string) (topics []string, unregistered []string) {
 	set := map[string]struct{}{}
 	for _, t := range types {
-		if reg, ok := kafka.LookupEvent(t); ok {
-			set[reg.FullTopic("sentiae")] = struct{}{}
+		reg, ok := kafka.LookupEvent(t)
+		if !ok {
+			unregistered = append(unregistered, t)
 			continue
 		}
-		set[fallbackTopic(t)] = struct{}{}
+		set[reg.FullTopic("sentiae")] = struct{}{}
 	}
-	out := make([]string, 0, len(set))
+	topics = make([]string, 0, len(set))
 	for t := range set {
-		out = append(out, t)
+		topics = append(topics, t)
 	}
-	return out
+	sort.Strings(topics)
+	return topics, unregistered
+}
+
+// logUnregistered reports event types with no taxonomy entry. Loud but not
+// fatal: the remaining subscriptions still work.
+func logUnregistered(consumer string, unregistered []string) {
+	if len(unregistered) == 0 {
+		return
+	}
+	logger.Error("pulse %s consumer: no topic for unregistered event types %v — those events will not be tracked", consumer, unregistered)
 }
