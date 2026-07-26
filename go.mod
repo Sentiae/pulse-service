@@ -8,7 +8,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/sentiae/ops-service v0.1.0
-	github.com/sentiae/platform-kit v0.3.14
+	github.com/sentiae/platform-kit v0.3.15
 	github.com/sentiae/work-service v0.4.0
 	github.com/spiffe/go-spiffe/v2 v2.6.0
 	google.golang.org/grpc v1.82.1
