@@ -19,7 +19,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 	"gorm.io/gorm"
-	gormlogger "gorm.io/gorm/logger"
 
 	httphandler "github.com/sentiae/pulse-service/internal/handler/http"
 	"github.com/sentiae/pulse-service/internal/infrastructure/messaging"
@@ -122,16 +121,14 @@ func (c *Container) initDatabase() error {
 	if err != nil {
 		port = 5432
 	}
-	logLevel := gormlogger.Warn
-	switch c.Config.Database.Postgres.LogLevel {
-	case "info":
-		logLevel = gormlogger.Info
-	case "error":
-		logLevel = gormlogger.Error
-	case "silent":
-		logLevel = gormlogger.Silent
-	}
 	pg := c.Config.Database.Postgres
+	// database.postgres.log_level (default "warn") already chose the ORM level,
+	// so it stays the source. What changes is that gormlog.New parses the level
+	// NAME itself, which removes the local switch onto gorm's enum and with it
+	// this file's import of gorm's own logger package (D-400). Parsing is now
+	// fail-closed: an unrecognised name is an error out of NewDB instead of a
+	// silent fall back to Warn.
+	logLevel := pg.LogLevel
 
 	// OWNER connection for schema DDL (golang-migrate baseline incl. RLS) — D-070
 	// role split. Uses MigrateUser/MigratePassword when set, else falls back to the
